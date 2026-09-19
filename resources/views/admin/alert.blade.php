@@ -1,0 +1,2082 @@
+<!DOCTYPE html>
+<html lang="{{ str_replace('_', '-', app()->getLocale()) }}">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="csrf-token" content="{{ csrf_token() }}">
+	<title>Alerts</title>
+	<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+	<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+	<style nonce="{{ $cspNonce }}">
+		:root {
+			font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+			--sidebar-bg: #39459a;
+			--sidebar-bg-light: #4b5cd1;
+			--text-white: #f4f6ff;
+			--text-yellow: #ffe632;
+			--muted: #d8defe;
+			--line: rgba(255, 255, 255, 0.18);
+		}
+
+		* {
+			box-sizing: border-box;
+		}
+
+		body {
+			margin: 0;
+			background: #eef2ff;
+			color: #0f172a;
+		}
+
+		.layout {
+			display: flex;
+			height: 100vh; /* constrain to viewport so main can scroll internally */
+		}
+
+		.sidebar {
+			width: 260px;
+			min-height: 100vh;
+			background: linear-gradient(180deg, #243c96 0%, #2d3fa3 45%, #3146b4 100%);
+			color: #fff;
+			padding: 18px 14px;
+			box-shadow: 4px 0 20px rgba(0, 0, 0, 0.12);
+			position: fixed;
+			top: 0;
+			left: 0;
+			bottom: 0;
+			height: 100vh;
+			overflow-y: auto;
+			z-index: 1000;
+		}
+
+		.sidebar::-webkit-scrollbar {
+			width: 6px;
+		}
+
+		.sidebar::-webkit-scrollbar-thumb {
+			background: rgba(255, 255, 255, 0.18);
+			border-radius: 10px;
+		}
+
+		.sidebar-brand {
+			gap: 12px;
+			padding: 10px 10px 18px;
+			margin-bottom: 10px;
+			border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+		}
+
+		.brand-icon {
+			width: 44px;
+			height: 44px;
+			border-radius: 12px;
+			background: rgba(255, 255, 255, 0.14);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			font-size: 22px;
+			flex-shrink: 0;
+		}
+
+		.brand-title {
+			margin: 0;
+			font-size: 0;
+			line-height: 1;
+			font-weight: 800;
+			letter-spacing: -0.02em;
+			display: flex;
+			gap: 6px;
+			align-items: baseline;
+		}
+
+		.brand-title span:first-child {
+			color: #ffd84d;
+			font-size: 28px;
+		}
+
+		.brand-title span:last-child {
+			color: #ffffff;
+			font-size: 26px;
+			font-weight: 700;
+		}
+
+		.brand-subtitle {
+			color: rgba(255, 255, 255, 0.78);
+			font-size: 12px;
+			display: block;
+			margin-top: 2px;
+		}
+
+		.sidebar-section {
+			margin-top: 18px;
+		}
+
+		.sidebar-label {
+			font-size: 11px;
+			font-weight: 700;
+			letter-spacing: 1px;
+			color: rgba(255, 255, 255, 0.55);
+			margin: 0 0 8px 10px;
+			text-transform: uppercase;
+		}
+
+		.sidebar-link {
+			width: 100%;
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			color: #fff;
+			text-decoration: none;
+			padding: 12px 14px;
+			border-radius: 12px;
+			margin-bottom: 6px;
+			position: relative;
+			transition: all 0.25s ease;
+			font-weight: 500;
+			border: none;
+			background: transparent;
+		}
+
+		.sidebar-link:hover {
+			background: rgba(255, 255, 255, 0.10);
+			color: #fff;
+			transform: translateX(4px);
+		}
+
+		.sidebar-link.active {
+			background: linear-gradient(90deg, #4f62ff, #6678ff);
+			color: #fff;
+			box-shadow: 0 8px 20px rgba(46, 78, 255, 0.28);
+		}
+
+		.sidebar-link.active::before {
+			content: "";
+			position: absolute;
+			left: -14px;
+			top: 8px;
+			bottom: 8px;
+			width: 4px;
+			border-radius: 10px;
+			background: #ffd84d;
+		}
+
+		.sidebar-icon {
+			width: 20px;
+			text-align: center;
+			font-size: 18px;
+			flex-shrink: 0;
+		}
+
+		.sidebar-text {
+			flex: 1;
+			text-align: left;
+		}
+
+		.sidebar-badge {
+			background: #ff4d4f;
+			color: #fff;
+			font-size: 11px;
+			font-weight: 700;
+			padding: 3px 8px;
+			border-radius: 50px;
+			min-width: 22px;
+			text-align: center;
+		}
+
+		.sidebar-toggle {
+			justify-content: space-between;
+			cursor: pointer;
+		}
+
+		.dropdown-arrow {
+			transition: transform 0.25s ease;
+			font-size: 13px;
+		}
+
+		.sidebar-dropdown.open .dropdown-arrow,
+		.sidebar-toggle[aria-expanded="true"] .dropdown-arrow {
+			transform: rotate(180deg);
+		}
+
+		.submenu {
+			display: none;
+			margin: 6px 0 8px 14px;
+			padding-left: 14px;
+			border-left: 1px solid rgba(255, 255, 255, 0.15);
+		}
+
+		.sidebar-dropdown.open .submenu {
+			display: block;
+		}
+
+		.submenu-link {
+			display: flex;
+			align-items: center;
+			gap: 10px;
+			color: rgba(255, 255, 255, 0.88);
+			text-decoration: none;
+			padding: 10px 12px;
+			border-radius: 10px;
+			margin-bottom: 5px;
+			font-size: 14px;
+			transition: all 0.2s ease;
+		}
+
+		.submenu-link:hover {
+			background: rgba(255, 255, 255, 0.10);
+			color: #fff;
+			transform: translateX(3px);
+		}
+
+		.submenu-link.active {
+			background: rgba(255, 255, 255, 0.16);
+			color: #ffd84d;
+			font-weight: 600;
+		}
+
+		.sidebar-footer {
+			padding-top: 16px;
+			margin-top: 20px;
+			border-top: 1px solid rgba(255, 255, 255, 0.12);
+		}
+
+		.admin-card {
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			background: rgba(255, 255, 255, 0.08);
+			border-radius: 14px;
+			padding: 12px;
+			margin-bottom: 12px;
+		}
+
+		.admin-avatar {
+			width: 42px;
+			height: 42px;
+			border-radius: 50%;
+			background: rgba(255, 255, 255, 0.15);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			font-size: 22px;
+			flex-shrink: 0;
+		}
+
+		.admin-info h6 {
+			font-size: 15px;
+			font-weight: 700;
+			color: #fff;
+		}
+
+		.admin-info small {
+			color: rgba(255, 255, 255, 0.72);
+		}
+
+		.logout-btn {
+			width: 100%;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			gap: 8px;
+			background: #fff;
+			color: #ff3b30;
+			text-decoration: none;
+			padding: 11px 14px;
+			border-radius: 12px;
+			font-weight: 700;
+			transition: all 0.25s ease;
+		}
+
+		.logout-btn:hover {
+			background: #ffe9e9;
+			color: #ff3b30;
+			transform: translateY(-1px);
+		}
+
+		.main {
+			flex: 1;
+			background: #f7f8ff;
+			padding: 24px 32px;
+			margin-left: 260px;
+			min-height: 100vh;
+			overflow-y: auto; /* scrolls internally so body doesn't scroll */
+			height: 100vh;
+		}
+
+		.page-title {
+			margin: 0;
+			font-size: 28px;
+			font-weight: 700;
+			color: #0f172a;
+		}
+
+ 		.alert-stats {
+ 			display: grid;
+ 			grid-template-columns: repeat(4, minmax(0, 1fr));
+ 			gap: 16px;
+ 			margin-top: 18px;
+ 		}
+
+		.stat-card,
+		.alerts-panel,
+		.legend-card {
+			background: #ffffff;
+			border-radius: 12px;
+			border: 1px solid #e8ecf1;
+			box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+		}
+
+		.stat-card {
+			padding: 16px;
+		}
+
+		.stat-icon {
+			width: 28px;
+			height: 28px;
+			border-radius: 6px;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			margin-bottom: 10px;
+		}
+
+		.stat-icon svg {
+			width: 18px;
+			height: 18px;
+		}
+
+		.stat-number {
+			margin: 0;
+			font-size: 32px;
+			line-height: 1;
+			font-weight: 500;
+			color: #111827;
+		}
+
+		.stat-label {
+			margin: 6px 0 0;
+			font-size: 14px;
+			color: #1f2937;
+		}
+
+		.stat-card.unresolved {
+			background: #fff8ef;
+			border-color: #ffd9b0;
+		}
+
+		.stat-card.unresolved .stat-icon {
+			background: #ffe9d4;
+			color: #f97316;
+		}
+
+		.stat-card.resolved {
+			background: #eefdf4;
+			border-color: #bcefd2;
+		}
+
+		.stat-card.resolved .stat-icon {
+			background: #d4f8e3;
+			color: #22c55e;
+		}
+
+		.stat-card.total {
+			background: #f8f9fc;
+			border-color: #e4e7ef;
+		}
+
+		.stat-card.total .stat-icon {
+			background: #eef1f7;
+			color: #64748b;
+		}
+
+		/* Critical alerts */
+		.stat-card.critical {
+			background: #fff1f2;
+			border-color: #ffccd5;
+		}
+
+		.stat-card.critical .stat-icon {
+			background: #ffe1e6;
+			color: #dc2626;
+		}
+
+		.alerts-panel {
+			margin-top: 18px;
+			overflow: hidden;
+		}
+
+		.alert-filters-card {
+			margin-top: 14px;
+			padding: 12px;
+			background: #ffffff;
+			border-radius: 12px;
+			border: 1px solid #e8ecf1;
+			box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+		}
+
+		.alert-filters-row {
+			display: grid;
+			grid-template-columns: 1.2fr repeat(4, minmax(0, 1fr)) 1fr 1fr auto;
+			gap: 10px;
+			align-items: center;
+		}
+
+		.alert-filter-input,
+		.alert-filter-select,
+		.alert-filter-date {
+			height: 38px;
+			border: 1px solid #d6dde8;
+			outline: none;
+			background: #f3f4f6;
+			border-radius: 8px;
+			padding: 0 12px;
+			font-size: 14px;
+			color: #1f2a44;
+		}
+
+		.alert-filter-input::placeholder {
+			color: #64748b;
+		}
+
+		.alert-filter-clear {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			height: 38px;
+			padding: 0 14px;
+			border-radius: 8px;
+			text-decoration: none;
+			font-size: 13px;
+			font-weight: 700;
+			color: #334155;
+			background: #eef2ff;
+			border: 1px solid #d6deef;
+			white-space: nowrap;
+		}
+
+		.alert-filter-clear:hover {
+			background: #e2e8f0;
+		}
+
+		.alert-filter-clear.disabled {
+			opacity: 0.55;
+			pointer-events: none;
+		}
+
+		.alert-filter-count {
+			margin: 8px 2px 0;
+			font-size: 13px;
+			color: #334155;
+		}
+
+		.panel-tabs {
+			display: flex;
+			gap: 30px;
+			padding: 10px 16px;
+			border-bottom: 1px solid #e5e7eb;
+		}
+
+		.tab-link {
+			font-size: 14px;
+			color: #1f2937;
+			text-decoration: none;
+		}
+
+		.tab-link.active {
+			color: #4b5cd1;
+			text-decoration: underline;
+			text-underline-offset: 2px;
+		}
+
+		.empty-state {
+			height: 210px;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			flex-direction: column;
+			gap: 10px;
+			color: #c2c6ce;
+		}
+
+		.empty-state svg {
+			width: 52px;
+			height: 52px;
+		}
+
+		.empty-title {
+			margin: 0;
+			font-size: 32px;
+			line-height: 1;
+			font-weight: 500;
+			color: #c8ccd3;
+		}
+
+		.empty-subtitle {
+			margin: 0;
+			font-size: 27px;
+			color: #d2d6dd;
+		}
+
+		.legend-card {
+			margin-top: 24px;
+			padding: 14px 16px;
+		}
+
+		.legend-title {
+			margin: 0 0 10px;
+			font-size: 14px;
+			font-weight: 500;
+			color: #111827;
+		}
+
+		.legend-grid {
+			display: grid;
+			grid-template-columns: repeat(4, minmax(0, 1fr));
+			gap: 10px;
+		}
+
+		.legend-item {
+			display: flex;
+			align-items: flex-start;
+			gap: 10px;
+		}
+
+		.legend-icon {
+			width: 28px;
+			height: 28px;
+			border-radius: 6px;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			flex-shrink: 0;
+		}
+
+		.legend-icon svg {
+			width: 17px;
+			height: 17px;
+		}
+
+		.legend-text {
+			font-size: 13px;
+			line-height: 1.2;
+			color: #111827;
+		}
+
+		.legend-subtext {
+			display: block;
+			margin-top: 4px;
+			font-size: 12px;
+			color: #4b5563;
+		}
+
+		.legend-wrong {
+			background: #ffe9d4;
+			color: #f97316;
+		}
+
+		.legend-suspicious {
+			background: #ffe1e1;
+			color: #ef4444;
+		}
+
+		.legend-overstay {
+			background: #feefc7;
+			color: #f59e0b;
+		}
+
+		.legend-unauthorized {
+			background: #f0ddff;
+			color: #9333ea;
+		}
+
+		@media (max-width: 1180px) {
+			.alert-stats {
+				grid-template-columns: 1fr;
+			}
+
+			.alert-filters-row {
+				grid-template-columns: repeat(2, minmax(0, 1fr));
+			}
+
+			.legend-grid {
+				grid-template-columns: repeat(2, minmax(0, 1fr));
+			}
+		}
+		@media (max-width: 1024px) {
+			.alert-filters-row {
+				grid-template-columns: 1fr;
+			}
+		}
+
+		@media (max-width: 480px) {
+			.legend-grid {
+				grid-template-columns: 1fr;
+			}
+
+			.panel-tabs {
+				gap: 14px;
+				padding: 10px 12px;
+			}
+
+			.tab-link {
+				font-size: 13px;
+			}
+
+			.empty-title {
+				font-size: 24px;
+			}
+
+			.empty-subtitle {
+				font-size: 16px;
+			}
+
+			.sidebar-link,
+			.admin-info h6,
+			.logout-btn {
+				font-size: 16px;
+			}
+
+			.brand-title {
+				font-size: 20px;
+			}
+		}
+
+				/* compact table sizing for alerts */
+				.alerts-table {
+					font-size: 15px;
+					width: 100%;
+					border-collapse: collapse;
+				}
+
+				.alerts-table thead tr {
+					border-bottom: 1px solid #e6edf6;
+				}
+
+				.alerts-table tbody tr {
+					border-bottom: 1px solid #f1f5f9;
+				}
+
+				.alerts-table .datetime-stack {
+					line-height: 1;
+				}
+
+				.alerts-table .datetime-time {
+					color: #6b7280;
+					font-size: 13px;
+				}
+
+				.view-btn {
+					background: #4b5cd1;
+					color: #fff;
+					padding: 6px 10px;
+					border-radius: 8px;
+					border: 0;
+				}
+
+				.table-empty-cell {
+					padding: 16px;
+					color: #7b8794;
+					text-align: center;
+				}
+
+				.js-hidden {
+					display: none;
+				}
+
+				.detail-value.is-muted {
+					font-style: italic;
+					color: #64748b;
+				}
+
+				.alert-modal-title.resolve-title {
+					font-size: 22px;
+				}
+
+				.alerts-table thead th {
+					padding: 6px 6px !important;
+					font-weight: 500 !important;
+				}
+
+				.alerts-table tbody td {
+					padding: 8px 6px !important;
+				}
+
+				.alert-pill {
+					display: inline-flex;
+					align-items: center;
+					padding: 4px 10px;
+					border-radius: 999px;
+					font-size: 11px;
+					font-weight: 700;
+					line-height: 1.15;
+					white-space: nowrap;
+				}
+
+				.severity-low { background: #e5e7eb; color: #374151; }
+				.severity-medium { background: #fef3c7; color: #92400e; }
+				.severity-high { background: #ffedd5; color: #c2410c; }
+				.severity-critical { background: #fee2e2; color: #b91c1c; }
+
+				.status-unresolved { background: #fee2e2; color: #b91c1c; }
+				.status-resolved { background: #dcfce7; color: #166534; }
+
+				.table-wrap { overflow-x: auto; }
+
+				@include('admin.partials.table-pagination-styles')
+
+				.alerts-pagination-bar {
+					border-top: 1px solid #e6edf6;
+					background: #fafbff;
+					margin-top: 0;
+					border-radius: 0 0 12px 12px;
+				}
+
+				/* Alert details modal - card layout (requested UI) */
+				.alert-modal {
+					display: none;
+					position: fixed;
+					top: 0;
+					right: 0;
+					bottom: 0;
+					left: 260px;
+					z-index: 1200;
+					background: rgba(15, 23, 42, 0.35);
+					overflow: auto;
+					padding: 16px;
+					align-items: center;
+					justify-content: center;
+				}
+
+				.alert-modal.is-open {
+					display: flex;
+				}
+
+				.alert-modal-card {
+					width: 940px;
+					max-width: min(940px, 100%);
+					margin: 0 auto;
+					background: #ffffff;
+					border-radius: 16px;
+					box-shadow: 0 10px 30px rgba(2, 6, 23, 0.2);
+					overflow: hidden;
+					max-height: calc(100vh - 32px);
+					display: flex;
+					flex-direction: column;
+				}
+
+				.alert-modal-header {
+					display: flex;
+					justify-content: space-between;
+					align-items: center;
+					padding: 16px 22px;
+					border-bottom: 1px solid #e9edf3;
+					background: #fff;
+				}
+
+				.alert-modal-title-wrap small {
+					color: #64748b;
+					font-size: 12px;
+				}
+
+				.alert-modal-title {
+					margin: 0;
+					font-size: 24px;
+					line-height: 1.1;
+					font-weight: 700;
+					color: #0f172a;
+				}
+
+				.alert-modal-close {
+					background: #eef2f7;
+					border: 1px solid #d9e1ec;
+					width: 34px;
+					height: 34px;
+					border-radius: 999px;
+					font-size: 18px;
+					line-height: 1;
+					color: #64748b;
+					cursor: pointer;
+				}
+
+				.alert-modal-body {
+					padding: 18px 22px;
+					background: #f8fafc;
+					overflow-y: auto;
+					flex: 1 1 auto;
+					min-height: 0;
+				}
+
+				.alert-info-card {
+					background: #fff;
+					border: 0;
+					border-radius: 14px;
+					box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08);
+					margin-bottom: 14px;
+					overflow: hidden;
+				}
+
+				.alert-info-card .card-title {
+					margin: 0;
+					font-size: 18px;
+					font-weight: 700;
+					padding: 14px 16px;
+					border-bottom: 1px solid #eef2f7;
+				}
+
+				.alert-info-card .card-content {
+					padding: 14px 16px;
+				}
+
+				.detail-grid {
+					display: grid;
+					grid-template-columns: repeat(2, minmax(0, 1fr));
+					gap: 12px 16px;
+				}
+
+				.detail-grid .full {
+					grid-column: 1 / -1;
+				}
+
+				.detail-label {
+					font-size: 12px;
+					color: #64748b;
+					margin-bottom: 4px;
+				}
+
+				.detail-value {
+					font-size: 14px;
+					font-weight: 600;
+					color: #0f172a;
+					word-break: break-word;
+				}
+
+				.badge-pill {
+					display: inline-flex;
+					align-items: center;
+					padding: 6px 10px;
+					border-radius: 999px;
+					font-size: 12px;
+					font-weight: 700;
+				}
+
+				.badge-danger { background: #fee2e2; color: #b91c1c; }
+				.badge-success { background: #dcfce7; color: #166534; }
+				.badge-warning { background: #fef3c7; color: #92400e; }
+				.badge-high { background: #ffedd5; color: #c2410c; }
+				.badge-medium { background: #fef3c7; color: #92400e; }
+				.badge-low { background: #e5e7eb; color: #374151; }
+				.badge-critical { background: #fee2e2; color: #b91c1c; }
+
+				.alert-modal-footer {
+					padding: 14px 22px;
+					background: #fff;
+					display: flex;
+					justify-content: flex-end;
+					gap: 10px;
+					border-top: 1px solid #e9edf3;
+				}
+
+				.modal-line {
+					margin: 0 0 10px;
+					font-size: 15px;
+					line-height: 1.2;
+					color: #475569;
+				}
+
+				.modal-line span {
+					font-weight: 600;
+					color: #0f172a;
+				}
+
+				.resolve-btn {
+					background: #2563eb;
+					color: #ffffff;
+					border: 0;
+					border-radius: 10px;
+					padding: 10px 18px;
+					font-size: 14px;
+					font-weight: 700;
+					cursor: pointer;
+					box-shadow: 0 5px 15px rgba(37, 99, 235, 0.28);
+				}
+
+				.btn-secondary {
+					background: #eef2f7;
+					color: #334155;
+					border: 1px solid #d9e1ec;
+					border-radius: 10px;
+					padding: 10px 18px;
+					font-size: 14px;
+					font-weight: 600;
+					cursor: pointer;
+				}
+
+				.resolve-flow-modal {
+					display: none;
+					position: fixed;
+					top: 0;
+					right: 0;
+					bottom: 0;
+					left: 260px;
+					z-index: 1250;
+					background: rgba(15, 23, 42, 0.4);
+					overflow: auto;
+					padding: 16px;
+					align-items: center;
+					justify-content: center;
+				}
+
+				.resolve-flow-modal.is-open {
+					display: flex;
+				}
+
+				.resolve-flow-card {
+					width: 620px;
+					max-width: min(620px, 100%);
+					margin: 0 auto;
+					background: #ffffff;
+					border-radius: 16px;
+					box-shadow: 0 10px 30px rgba(2, 6, 23, 0.2);
+					overflow: hidden;
+				}
+
+				.resolve-flow-body {
+					padding: 18px 22px;
+				}
+
+				.resolve-summary {
+					padding: 0 0 8px;
+				}
+
+				.resolve-summary .modal-line {
+					margin-bottom: 6px;
+					font-size: 14px;
+				}
+
+				.resolve-divider {
+					border: 0;
+					height: 1px;
+					background: #e5e7eb;
+					margin: 14px 0;
+				}
+
+				.resolve-notes-wrap {
+					margin-top: 0;
+					padding-top: 0;
+					border-top: 0;
+				}
+
+				.resolve-notes-label {
+					display: block;
+					font-size: 14px;
+					font-weight: 700;
+					color: #111827;
+					margin-bottom: 8px;
+				}
+
+				.resolve-notes-input {
+					width: 100%;
+					min-height: 92px;
+					resize: vertical;
+					border: 1px solid #d7e0eb;
+					border-radius: 10px;
+					padding: 10px 12px;
+					font: inherit;
+					font-size: 14px;
+					line-height: 1.45;
+					color: #0f172a;
+					outline: none;
+				}
+
+				.resolve-notes-input:focus {
+					border-color: #93c5fd;
+					box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+				}
+
+				.resolve-warning {
+					margin: 8px 0 0;
+					font-size: 12px;
+					color: #6b7280;
+				}
+
+				.resolve-flow-footer {
+					padding: 14px 22px;
+					background: #ffffff;
+					display: flex;
+					justify-content: flex-end;
+					gap: 12px;
+					border-top: 1px solid #e9edf3;
+				}
+
+				.resolve-action-btn {
+					border-radius: 999px;
+					padding: 9px 18px;
+					font-size: 14px;
+					font-weight: 700;
+					border: 0;
+					cursor: pointer;
+				}
+
+				.resolve-action-btn.cancel {
+					background: #6b7280;
+					color: #fff;
+				}
+
+				.resolve-action-btn.confirm {
+					background: #16a34a;
+					color: #fff;
+				}
+
+				.resolve-severity-badge {
+					display: inline-flex;
+					align-items: center;
+					padding: 4px 10px;
+					border-radius: 999px;
+					font-size: 12px;
+					font-weight: 700;
+					color: #92400e;
+					background: #fef3c7;
+				}
+
+				@media (max-width: 920px) {
+					.alert-modal,
+					.resolve-flow-modal {
+						left: 0;
+					}
+
+					.alert-modal-title { font-size: 20px; }
+					.alert-modal-card { width: 100%; max-width: calc(100% - 12px); }
+					.detail-grid { grid-template-columns: 1fr; }
+					.modal-section-title { font-size: 13px; }
+					.modal-line { font-size: 14px; }
+					.resolve-btn { font-size: 13px; padding: 9px 14px; }
+					.alert-grid { grid-template-columns: 1fr; gap: 18px; }
+					.alert-divider { display: none; }
+					.resolve-flow-footer { flex-direction: column-reverse; align-items: stretch; }
+				}
+
+		@include('admin.partials.admin-topbar-styles')
+		@include('admin.partials.admin-responsive-styles')
+	</style>
+</head>
+<body>
+	<div class="layout">
+		<aside class="sidebar d-flex flex-column justify-content-between">
+			<div>
+				<div class="sidebar-brand d-flex align-items-center">
+					<div class="brand-icon">
+						<i class="bi bi-person-badge-fill"></i>
+					</div>
+					<div>
+						<h4 class="brand-title mb-0"><span>VMS</span> <span>Admin</span></h4>
+						<small class="brand-subtitle">Visitor Monitoring System</small>
+					</div>
+				</div>
+
+				<div class="sidebar-section">
+					<p class="sidebar-label">MAIN</p>
+					<a href="/admin/dashboard" class="sidebar-link {{ request()->is('admin/dashboard') ? 'active' : '' }}">
+						<span class="sidebar-icon"><i class="bi bi-grid-1x2-fill"></i></span>
+						<span class="sidebar-text">Dashboard</span>
+					</a>
+				</div>
+
+				<div class="sidebar-section">
+					<p class="sidebar-label">MONITORING</p>
+					@php
+						$sidebarUnresolvedAlertsCount = (int) \Illuminate\Support\Facades\DB::table('alerts')
+							->whereRaw("LOWER(TRIM(COALESCE(status, ''))) = ?", ['unresolved'])
+							->count();
+					@endphp
+					<a href="/admin/visitor" class="sidebar-link {{ request()->is('admin/visitor*') ? 'active' : '' }}">
+						<span class="sidebar-icon"><i class="bi bi-people-fill"></i></span>
+						<span class="sidebar-text">Visitor Monitoring</span>
+					</a>
+					<a href="/admin/alerts" class="sidebar-link {{ request()->is('admin/alerts*') ? 'active' : '' }}">
+						<span class="sidebar-icon"><i class="bi bi-exclamation-triangle-fill"></i></span>
+						<span class="sidebar-text">Alerts</span>
+						<span class="sidebar-badge">{{ $sidebarUnresolvedAlertsCount }}</span>
+					</a>
+					@include('admin.partials.sidebar-guard-duty-link')
+					<a href="/admin/daily-reports" class="sidebar-link {{ request()->is('admin/daily-reports*') ? 'active' : '' }}">
+						<span class="sidebar-icon"><i class="bi bi-file-earmark-excel-fill"></i></span>
+						<span class="sidebar-text">Daily Reports</span>
+					</a>
+					<a href="/admin/date-range-reports" class="sidebar-link {{ request()->is('admin/date-range-reports*') ? 'active' : '' }}">
+						<span class="sidebar-icon"><i class="bi bi-calendar-range-fill"></i></span>
+						<span class="sidebar-text">Date-Range Reports</span>
+					</a>
+				</div>
+
+				@php
+					$isUserMgmtOpen = request()->is('admin/user/guards*') || request()->is('admin/user/offices*');
+				@endphp
+				<div class="sidebar-section">
+					<p class="sidebar-label">MANAGEMENT</p>
+					<div class="sidebar-dropdown {{ $isUserMgmtOpen ? 'open' : '' }}" id="userMenuGroup">
+						<button class="sidebar-link sidebar-toggle {{ $isUserMgmtOpen ? 'active' : '' }}"
+							type="button"
+							id="userMenuToggle"
+							aria-expanded="{{ $isUserMgmtOpen ? 'true' : 'false' }}">
+							<span class="d-flex align-items-center gap-2">
+								<span class="sidebar-icon"><i class="bi bi-person-lines-fill"></i></span>
+								<span class="sidebar-text">User Management</span>
+							</span>
+							<span class="dropdown-arrow"><i class="bi bi-chevron-down"></i></span>
+						</button>
+						<div class="submenu" id="userSubmenu">
+							<a href="/admin/user/guards" class="submenu-link {{ request()->is('admin/user/guards*') ? 'active' : '' }}">
+								<i class="bi bi-shield-fill-check"></i>
+								<span>Guards</span>
+							</a>
+							<a href="/admin/user/offices" class="submenu-link {{ request()->is('admin/user/offices*') ? 'active' : '' }}">
+								<i class="bi bi-building"></i>
+								<span>Offices</span>
+							</a>
+						</div>
+					</div>
+					@include('admin.partials.sidebar-activity-logs-link')
+					@include('admin.partials.sidebar-login-attempts-link')
+				</div>
+			</div>
+
+			
+			<div class="sidebar-footer">
+				<div class="admin-card">
+					<div class="admin-avatar">
+						<i class="bi bi-person-circle"></i>
+					</div>
+					@php
+						$sidebarAuthUser = auth()->user();
+						$sidebarDisplayName = trim(((string) ($sidebarAuthUser->first_name ?? '')).' '.((string) ($sidebarAuthUser->last_name ?? '')));
+						$sidebarDisplayName = $sidebarDisplayName !== ''
+							? $sidebarDisplayName
+							: ((string) ($sidebarAuthUser->name ?? $sidebarAuthUser->email ?? 'User'));
+						$sidebarRoleLabel = ((int) ($sidebarAuthUser->role_id ?? 0) === 4) ? 'Guard' : 'System Administrator';
+					@endphp
+					<div class="admin-info">
+						<h6 class="mb-0">{{ $sidebarDisplayName }}</h6>
+						<small>{{ $sidebarRoleLabel }}</small>
+					</div>
+				</div>
+
+			</div>
+		</aside>
+
+		<main class="main">
+			@include('admin.partials.admin-topbar', ['title' => 'Security Alerts'])
+
+			<div class="alert-stats">
+				<div class="stat-card unresolved">
+					<span class="stat-icon" aria-hidden="true">
+						<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+							<path d="m12 3 10 18H2L12 3Zm0 6v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+							<circle cx="12" cy="17" r="1.2" fill="currentColor"/>
+						</svg>
+					</span>
+					<p class="stat-number" id="unresolvedCount">{{ $unresolvedCount ?? 0 }}</p>
+					<p class="stat-label">Unresolved Alerts</p>
+				</div>
+
+				<div class="stat-card resolved">
+					<span class="stat-icon" aria-hidden="true">
+						<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+							<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/>
+							<path d="m8.5 12.5 2.5 2.5 4.5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+						</svg>
+					</span>
+					<p class="stat-number" id="resolvedCount">{{ $resolvedCount ?? 0 }}</p>
+					<p class="stat-label">Resolved Alerts</p>
+				</div>
+
+				<div class="stat-card total">
+					<span class="stat-icon" aria-hidden="true">
+						<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+							<path d="m12 3 10 18H2L12 3Zm0 6v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+							<circle cx="12" cy="17" r="1.2" fill="currentColor"/>
+						</svg>
+					</span>
+					<p class="stat-number" id="totalCount">{{ $total ?? 0 }}</p>
+					<p class="stat-label">Total Alerts</p>
+				</div>
+
+				<div class="stat-card critical">
+					<span class="stat-icon" aria-hidden="true">
+						<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+							<path d="M12 2 2 22h20L12 2z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+							<path d="M12 8v5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+							<circle cx="12" cy="17" r="0.8" fill="currentColor"/>
+						</svg>
+					</span>
+					<p class="stat-number" id="criticalCount">{{ isset($criticalCount) ? $criticalCount : 0 }}</p>
+					<p class="stat-label">Critical Alerts</p>
+				</div>
+			</div>
+
+			<div class="alert-filters-card">
+				<form method="GET" action="{{ url('/admin/alerts') }}">
+					<div class="alert-filters-row">
+						<input class="alert-filter-input" type="text" name="search" value="{{ $filters['search'] ?? '' }}" placeholder="Search visitor..." aria-label="Search visitor">
+
+						<select class="alert-filter-select" name="alert_type" aria-label="Filter by alert type" data-auto-submit>
+							<option value="">Alert Type</option>
+							@foreach(($alertTypeOptions ?? []) as $type)
+								<option value="{{ $type }}" @selected(($filters['alert_type'] ?? '') === $type)>{{ $type }}</option>
+							@endforeach
+						</select>
+
+						<select class="alert-filter-select" name="severity" aria-label="Filter by severity" data-auto-submit>
+							<option value="">Severity</option>
+							@foreach(($severityOptions ?? []) as $sev)
+								<option value="{{ $sev }}" @selected(($filters['severity'] ?? '') === $sev)>{{ $sev }}</option>
+							@endforeach
+						</select>
+
+						<select class="alert-filter-select" name="status" aria-label="Filter by status" data-auto-submit>
+							<option value="">Status</option>
+							@foreach(($statusOptions ?? []) as $st)
+								<option value="{{ $st }}" @selected(($filters['status'] ?? '') === $st)>{{ $st }}</option>
+							@endforeach
+						</select>
+
+						<select class="alert-filter-select" name="office" aria-label="Filter by office" data-auto-submit>
+							<option value="">Office</option>
+							@foreach(($officeOptions ?? []) as $office)
+								<option value="{{ $office }}" @selected(($filters['office'] ?? '') === $office)>{{ $office }}</option>
+							@endforeach
+						</select>
+
+						<input class="alert-filter-date" type="date" name="date_from" value="{{ $filters['date_from'] ?? '' }}" aria-label="Date from" data-auto-submit>
+						<input class="alert-filter-date" type="date" name="date_to" value="{{ $filters['date_to'] ?? '' }}" aria-label="Date to" data-auto-submit>
+
+						<a href="{{ url('/admin/alerts') }}" class="alert-filter-clear {{ !($hasActiveFilters ?? false) ? 'disabled' : '' }}">Clear</a>
+					</div>
+				</form>
+				<p class="alert-filter-count">Showing {{ count($alerts ?? []) }} filtered alerts ({{ $total ?? 0 }} total)</p>
+			</div>
+
+			<section class="alerts-panel">
+				<div class="panel-tabs">
+					<a href="#" class="tab-link {{ !($hasActiveFilters ?? false) ? 'active' : '' }}" data-filter="unresolved" data-empty-subtitle="All alerts have been resolved">Unresolved Alerts ({{ $unresolvedCount ?? 0 }})</a>
+					<a href="#" class="tab-link {{ ($hasActiveFilters ?? false) ? 'active' : '' }}" data-filter="all" data-empty-subtitle="No security alerts to display">All Alerts ({{ $total ?? 0 }})</a>
+					<a href="#" class="tab-link" data-filter="resolved" data-empty-subtitle="All alerts have been resolved">Resolved ({{ $resolvedCount ?? 0 }})</a>
+				</div>
+				<div class="table-wrap">
+					<table class="alerts-table">
+						<thead>
+							<tr>
+								<th>Alert ID</th>
+								<th>Date &amp; Time</th>
+								<th>Visitor Name</th>
+								<th>Pass No.</th>
+								<th>Control No.</th>
+								<th>Expected Office</th>
+								<th>Scanned Office</th>
+								<th>Alert Type</th>
+								<th>Severity</th>
+								<th>Status</th>
+								<th>Actions</th>
+							</tr>
+						</thead>
+						<tbody>
+							@php $hasAlerts = count($alerts ?? []) > 0; @endphp
+								@foreach(($alerts ?? []) as $alert)
+									<tr
+										data-status="{{ strtolower($alert['status'] ?? 'unknown') }}"
+										data-alert-id="{{ $alert['alert_id'] ?? '' }}"
+										data-created-at="{{ $alert['created_at'] ?? '' }}"
+										data-resolved-at="{{ $alert['resolved_at'] ?? '' }}">
+									<td>{{ $alert['alert_id'] ?? '' }}</td>
+									<td>
+										@php $dt = isset($alert['created_at']) ? \Carbon\Carbon::parse($alert['created_at']) : null; @endphp
+										@if($dt)
+											<div class="datetime-stack">
+												<div>{{ $dt->format('M d, Y') }}</div>
+												<div class="datetime-time">{{ $dt->format('h:i A') }}</div>
+											</div>
+										@else
+											-
+										@endif
+									</td>
+									<td>{{ ($alert['visitor']['first_name'] ?? '') . ' ' . ($alert['visitor']['last_name'] ?? '') }}</td>
+									<td>{{ $alert['visit']['pass_number'] ?? '' }}</td>
+									<td>{{ $alert['visit']['control_number'] ?? '' }}</td>
+									<td>{{ ($alert['visit']['office']['office_name'] ?? null) ?: ($alert['visit']['destination_text'] ?? ($alert['visit']['primary_office_id'] ?? '')) }}</td>
+									<td>{{ $alert['office_scan']['office']['office_name'] ?? '' }}</td>
+									<td>{{ $alert['alert_type'] ?? '' }}</td>
+									@php
+										$severityText = (string) ($alert['severity'] ?? 'Medium');
+										$severityClass = match (strtolower(trim($severityText))) {
+											'critical' => 'severity-critical',
+											'high' => 'severity-high',
+											'low' => 'severity-low',
+											default => 'severity-medium',
+										};
+
+										$statusText = (string) ($alert['status'] ?? 'Unresolved');
+										$statusClass = strtolower(trim($statusText)) === 'resolved' ? 'status-resolved' : 'status-unresolved';
+									@endphp
+									<td><span class="alert-pill {{ $severityClass }}">{{ $severityText }}</span></td>
+									<td><span class="alert-pill {{ $statusClass }}">{{ $statusText }}</span></td>
+										<td>
+										<button class="view-btn" data-alert-id="{{ $alert['alert_id'] ?? '' }}">View</button>
+									</td>
+								</tr>
+							@endforeach
+							<tr id="noResults" class="{{ $hasAlerts ? 'js-hidden' : '' }}">
+								<td colspan="11" class="table-empty-cell">No alerts found</td>
+							</tr>
+						</tbody>
+					</table>
+					<div class="table-pagination-bar alerts-pagination-bar" id="alertsPaginationBar" role="navigation" aria-label="Alert list pagination">
+						<div class="table-pagination-left">
+							<label class="table-pagination-label" for="alertsPageSize">Page size:</label>
+							<select id="alertsPageSize" class="table-page-size" aria-label="Page size">
+								<option value="5" selected>5</option>
+								<option value="10">10</option>
+								<option value="25">25</option>
+								<option value="50">50</option>
+								<option value="75">75</option>
+								<option value="100">100</option>
+							</select>
+							<span class="table-pagination-range" id="alertsPaginationRange">0 to 0 of 0</span>
+						</div>
+						<div class="table-pagination-right">
+							<button type="button" class="table-pagination-nav" id="alertsPaginationFirst" aria-label="First page">
+								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 6L5 12l6 6M19 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+							</button>
+							<button type="button" class="table-pagination-nav" id="alertsPaginationPrev" aria-label="Previous page">
+								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+							</button>
+							<span class="table-pagination-page" id="alertsPaginationPageLabel">Page <strong>1</strong> of 1</span>
+							<button type="button" class="table-pagination-nav" id="alertsPaginationNext" aria-label="Next page">
+								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+							</button>
+							<button type="button" class="table-pagination-nav" id="alertsPaginationLast" aria-label="Last page">
+								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6l6 6-6 6M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+							</button>
+						</div>
+					</div>
+				</div>
+			</section>
+
+			<section class="legend-card">
+				<h2 class="legend-title">Alert Types</h2>
+				<div class="legend-grid">
+					<div class="legend-item">
+						<span class="legend-icon legend-wrong" aria-hidden="true">
+							<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+								<path d="m12 3 10 18H2L12 3Zm0 6v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+								<circle cx="12" cy="17" r="1.2" fill="currentColor"/>
+							</svg>
+						</span>
+						<span class="legend-text">Wrong Office<span class="legend-subtext">Incorrect destination</span></span>
+					</div>
+
+					<div class="legend-item">
+						<span class="legend-icon legend-suspicious" aria-hidden="true">
+							<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+								<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/>
+								<path d="M9 9l6 6M15 9l-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+							</svg>
+						</span>
+						<span class="legend-text">Suspicious<span class="legend-subtext">Suspicious activity</span></span>
+					</div>
+
+					<div class="legend-item">
+						<span class="legend-icon legend-overstay" aria-hidden="true">
+							<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+								<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/>
+								<path d="M12 7v5l3 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+							</svg>
+						</span>
+						<span class="legend-text">Overstay<span class="legend-subtext">Extended visit time</span></span>
+					</div>
+
+					<div class="legend-item">
+						<span class="legend-icon legend-unauthorized" aria-hidden="true">
+							<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+								<path d="m12 3 10 18H2L12 3Zm0 6v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+								<circle cx="12" cy="17" r="1.2" fill="currentColor"/>
+							</svg>
+						</span>
+						<span class="legend-text">Unauthorized<span class="legend-subtext">Unauthorized access</span></span>
+					</div>
+				</div>
+			</section>
+		</main>
+	</div>
+
+	<!-- Alert Details Modal -->
+	<div id="alertModal" class="alert-modal">
+		<div class="alert-modal-card" role="dialog" aria-modal="true" aria-labelledby="alertDetailsTitle">
+			<div class="alert-modal-header">
+				<div class="alert-modal-title-wrap">
+					<h3 id="alertDetailsTitle" class="alert-modal-title">Alert Details</h3>
+					<small>View complete alert information</small>
+				</div>
+				<button id="closeAlertBtn" class="alert-modal-close" type="button" aria-label="Close">×</button>
+			</div>
+
+			<div class="alert-modal-body">
+				<section class="alert-info-card">
+					<h4 class="card-title">Alert Information</h4>
+					<div class="card-content detail-grid">
+						<div>
+							<div class="detail-label">Alert ID</div>
+							<div class="detail-value" id="m_alert_id">-</div>
+						</div>
+						<div>
+							<div class="detail-label">Alert Type</div>
+							<div class="detail-value" id="m_type">-</div>
+						</div>
+						<div>
+							<div class="detail-label">Severity</div>
+							<div><span id="m_severity" class="badge-pill badge-medium">Medium</span></div>
+						</div>
+						<div>
+							<div class="detail-label">Status</div>
+							<div><span id="m_status" class="badge-pill badge-danger">Unresolved</span></div>
+						</div>
+						<div class="full">
+							<div class="detail-label">Message</div>
+							<div class="detail-value" id="m_message">-</div>
+						</div>
+						<div class="full">
+							<div class="detail-label">Created At</div>
+							<div class="detail-value" id="m_created_at">-</div>
+						</div>
+					</div>
+				</section>
+
+				<section class="alert-info-card">
+					<h4 class="card-title">Visitor Information</h4>
+					<div class="card-content detail-grid">
+						<div>
+							<div class="detail-label">Visitor Name</div>
+							<div class="detail-value" id="m_visitor_name">-</div>
+						</div>
+						<div>
+							<div class="detail-label">Pass Number</div>
+							<div class="detail-value" id="m_pass_no">-</div>
+						</div>
+						<div>
+							<div class="detail-label">Control Number</div>
+							<div class="detail-value" id="m_control_no">-</div>
+						</div>
+						<div>
+							<div class="detail-label">Contact Number</div>
+							<div class="detail-value" id="m_contact">-</div>
+						</div>
+					</div>
+				</section>
+
+				<section class="alert-info-card">
+					<h4 class="card-title">Visit Information</h4>
+					<div class="card-content detail-grid">
+						<div><div class="detail-label">Visit ID</div><div class="detail-value" id="m_visit_id">-</div></div>
+						<div><div class="detail-label">Visit Type</div><div class="detail-value" id="m_visit_type">-</div></div>
+						<div><div class="detail-label">Purpose</div><div class="detail-value" id="m_purpose">-</div></div>
+						<div><div class="detail-label">Entry Time</div><div class="detail-value" id="m_entry_time">-</div></div>
+						<div><div class="detail-label">Exit Time</div><div class="detail-value" id="m_exit_time">-</div></div>
+						<div><div class="detail-label">Duration Minutes</div><div class="detail-value" id="m_duration">-</div></div>
+						<div class="full"><div class="detail-label">Assigned Primary Office</div><div class="detail-value" id="m_primary_office">-</div></div>
+					</div>
+				</section>
+
+				<section class="alert-info-card">
+					<h4 class="card-title">Scan Information</h4>
+					<div class="card-content detail-grid">
+						<div><div class="detail-label">Scan ID</div><div class="detail-value" id="m_scan_id">-</div></div>
+						<div><div class="detail-label">Scanned Office</div><div class="detail-value" id="m_scanned_office">-</div></div>
+						<div><div class="detail-label">Scanned By Guard/Staff</div><div class="detail-value" id="m_scanned_by">-</div></div>
+						<div><div class="detail-label">Scan Time</div><div class="detail-value" id="m_scan_time">-</div></div>
+						<div><div class="detail-label">Validation Status</div><div class="detail-value" id="m_validation_status">-</div></div>
+						<div><div class="detail-label">Remarks</div><div class="detail-value" id="m_remarks">-</div></div>
+					</div>
+				</section>
+
+				<section class="alert-info-card">
+					<h4 class="card-title">Resolution Information</h4>
+					<div class="card-content">
+						<div id="m_unresolved_text" class="detail-value is-muted">Not yet resolved</div>
+						<div id="m_resolved_details" class="js-hidden">
+							<div class="detail-grid">
+								<div><div class="detail-label">Resolved By</div><div class="detail-value" id="m_resolved_by">-</div></div>
+								<div><div class="detail-label">Resolved At</div><div class="detail-value" id="m_resolved_at">-</div></div>
+								<div class="full"><div class="detail-label">Resolution Notes</div><div class="detail-value" id="m_resolution_notes">-</div></div>
+							</div>
+						</div>
+					</div>
+				</section>
+			</div>
+
+			<div class="alert-modal-footer">
+				<button class="btn-secondary js-close-alert" type="button">Close</button>
+				<button id="resolveAlertBtn" class="resolve-btn" type="button">Resolve Alert</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Resolve Alert Modal -->
+	<div id="resolveModal" class="resolve-flow-modal">
+		<div class="resolve-flow-card" role="dialog" aria-modal="true" aria-labelledby="resolveAlertTitle">
+			<div class="alert-modal-header">
+				<h3 id="resolveAlertTitle" class="alert-modal-title resolve-title">Resolve Alert</h3>
+				<button id="closeResolveModalBtn" class="alert-modal-close" type="button" aria-label="Close">×</button>
+			</div>
+
+			<form data-prevent-submit>
+				<div class="resolve-flow-body">
+					<div class="resolve-summary">
+						<p class="modal-line"><strong>Alert ID:</strong> <span id="r_alert_id" class="value">-</span></p>
+						<p class="modal-line"><strong>Visitor:</strong> <span id="r_visitor" class="value">-</span></p>
+						<p class="modal-line"><strong>Type:</strong> <span id="r_alert_type" class="value">-</span></p>
+						<p class="modal-line"><strong>Severity:</strong> <span id="r_severity" class="resolve-severity-badge">Medium</span></p>
+					</div>
+
+					<hr class="resolve-divider">
+
+					<div class="resolve-notes-wrap">
+						<label for="resolveNotes" class="resolve-notes-label">Resolution Notes</label>
+						<textarea id="resolveNotes" class="resolve-notes-input" rows="4" placeholder="Enter how the alert was resolved..."></textarea>
+						<p class="resolve-warning">⚠️ Please describe how this alert was resolved.</p>
+					</div>
+				</div>
+
+				<div class="resolve-flow-footer">
+					<button id="cancelResolveBtn" class="resolve-action-btn cancel" type="button">Cancel</button>
+					<button id="confirmResolveBtn" class="resolve-action-btn confirm" type="button">Resolve</button>
+				</div>
+			</form>
+		</div>
+	</div>
+
+	<script nonce="{{ $cspNonce }}">
+		// Export alerts to JS for modal/detail interactions
+		const ALERTS = @json($alerts ?? []);
+
+		const userMenuGroup = document.getElementById('userMenuGroup');
+		const userMenuToggle = document.getElementById('userMenuToggle');
+		const alertTabLinks = document.querySelectorAll('.panel-tabs .tab-link');
+		const emptySubtitle = document.getElementById('emptySubtitle');
+		const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+		let pendingResolveAlertId = null;
+
+		const ALERTS_PAGE_SIZES = [5, 10, 25, 50, 75, 100];
+		let alertsPageSize = 5;
+		const alertsPageByFilter = { unresolved: 1, all: 1, resolved: 1 };
+
+		function rowMatchesAlertTab(row, filter) {
+			const status = (row.dataset.status || '').toLowerCase();
+			if (filter === 'all') {
+				return true;
+			}
+			if (filter === 'resolved') {
+				return status === 'resolved';
+			}
+			return status === 'unresolved';
+		}
+
+		function sortMatchingAlertRows(matching, filter) {
+			const parseDate = (value) => {
+				const ts = Date.parse(value || '');
+				return Number.isNaN(ts) ? 0 : ts;
+			};
+			const sorted = [...matching];
+			if (filter === 'resolved') {
+				sorted.sort((a, b) => {
+					const aResolved = parseDate(a.dataset.resolvedAt);
+					const bResolved = parseDate(b.dataset.resolvedAt);
+					if (bResolved !== aResolved) return bResolved - aResolved;
+
+					const aCreated = parseDate(a.dataset.createdAt);
+					const bCreated = parseDate(b.dataset.createdAt);
+					if (bCreated !== aCreated) return bCreated - aCreated;
+
+					const aId = parseInt(a.dataset.alertId || '0', 10);
+					const bId = parseInt(b.dataset.alertId || '0', 10);
+					return bId - aId;
+				});
+			} else {
+				sorted.sort((a, b) => {
+					const aId = parseInt(a.dataset.alertId || '0', 10);
+					const bId = parseInt(b.dataset.alertId || '0', 10);
+					return bId - aId;
+				});
+			}
+			return sorted;
+		}
+
+		function setAlertsNavDisabled(btn, disabled) {
+			if (!btn) return;
+			btn.disabled = disabled;
+			btn.classList.toggle('is-disabled', disabled);
+			btn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+			if (disabled) {
+				btn.setAttribute('tabindex', '-1');
+			} else {
+				btn.removeAttribute('tabindex');
+			}
+		}
+
+		function updateAlertsPaginationUi(filter, page, totalPages, totalMatching) {
+			const firstBtn = document.getElementById('alertsPaginationFirst');
+			const prevBtn = document.getElementById('alertsPaginationPrev');
+			const nextBtn = document.getElementById('alertsPaginationNext');
+			const lastBtn = document.getElementById('alertsPaginationLast');
+			const rangeEl = document.getElementById('alertsPaginationRange');
+			const pageLabel = document.getElementById('alertsPaginationPageLabel');
+			if (!rangeEl || !pageLabel) return;
+
+			if (totalMatching === 0) {
+				rangeEl.textContent = '0 to 0 of 0';
+				pageLabel.innerHTML = 'Page <strong>1</strong> of 1';
+				setAlertsNavDisabled(firstBtn, true);
+				setAlertsNavDisabled(prevBtn, true);
+				setAlertsNavDisabled(nextBtn, true);
+				setAlertsNavDisabled(lastBtn, true);
+				return;
+			}
+
+			const startIdx = (page - 1) * alertsPageSize;
+			const endIdx = Math.min(startIdx + alertsPageSize, totalMatching);
+			rangeEl.textContent = `${startIdx + 1} to ${endIdx} of ${totalMatching}`;
+			pageLabel.innerHTML = `Page <strong>${page}</strong> of ${totalPages}`;
+
+			const onFirst = page <= 1;
+			const onLast = page >= totalPages;
+			setAlertsNavDisabled(firstBtn, onFirst);
+			setAlertsNavDisabled(prevBtn, onFirst);
+			setAlertsNavDisabled(nextBtn, onLast);
+			setAlertsNavDisabled(lastBtn, onLast);
+		}
+
+		/** Filter by tab (unresolved / all / resolved), reorder rows, then paginate for that tab. */
+		function applyAlertTabFilter(filter) {
+			const tbody = document.querySelector('.alerts-table tbody');
+			if (!tbody) return;
+
+			const noResults = document.getElementById('noResults');
+			if (noResults && noResults.parentNode === tbody) {
+				noResults.remove();
+			}
+
+			const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => r.id !== 'noResults');
+			const nonMatching = rows.filter((r) => !rowMatchesAlertTab(r, filter));
+			const matching = rows.filter((r) => rowMatchesAlertTab(r, filter));
+			const sortedMatching = sortMatchingAlertRows(matching, filter);
+
+			nonMatching.forEach((r) => tbody.appendChild(r));
+			sortedMatching.forEach((r) => tbody.appendChild(r));
+			if (noResults) {
+				tbody.appendChild(noResults);
+			}
+
+			const totalMatching = sortedMatching.length;
+			const totalPages = Math.max(1, Math.ceil(totalMatching / alertsPageSize));
+			let page = parseInt(String(alertsPageByFilter[filter] || '1'), 10);
+			if (Number.isNaN(page) || page < 1) page = 1;
+			if (page > totalPages) page = totalPages;
+			alertsPageByFilter[filter] = page;
+
+			const start = (page - 1) * alertsPageSize;
+			nonMatching.forEach((r) => {
+				r.style.display = 'none';
+			});
+			sortedMatching.forEach((r, idx) => {
+				r.style.display = idx >= start && idx < start + alertsPageSize ? 'table-row' : 'none';
+			});
+
+			if (noResults) {
+				noResults.style.display = totalMatching === 0 ? 'table-row' : 'none';
+			}
+
+			updateAlertsPaginationUi(filter, page, totalPages, totalMatching);
+		}
+
+		function getActiveAlertFilter() {
+			const active = document.querySelector('.panel-tabs .tab-link.active');
+			return active ? (active.dataset.filter || 'all') : 'unresolved';
+		}
+
+		function goToAlertsPage(nextPage) {
+			const filter = getActiveAlertFilter();
+			alertsPageByFilter[filter] = nextPage;
+			applyAlertTabFilter(filter);
+		}
+
+		if (userMenuGroup && userMenuToggle) {
+			userMenuToggle.addEventListener('click', () => {
+				const isOpen = userMenuGroup.classList.toggle('open');
+				userMenuToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+			});
+		}
+
+		if (alertTabLinks.length) {
+			alertTabLinks.forEach((tabLink) => {
+				tabLink.addEventListener('click', (event) => {
+					event.preventDefault();
+					alertTabLinks.forEach((link) => link.classList.remove('active'));
+					tabLink.classList.add('active');
+
+					const filter = tabLink.dataset.filter || 'all';
+					alertsPageByFilter[filter] = alertsPageByFilter[filter] || 1;
+					applyAlertTabFilter(filter);
+
+					if (emptySubtitle) {
+						emptySubtitle.textContent = tabLink.dataset.emptySubtitle || 'No security alerts to display';
+					}
+				});
+			});
+
+			// Apply initial filter (show unresolved by default)
+			const initial = document.querySelector('.panel-tabs .tab-link.active');
+			const initFilter = initial ? (initial.dataset.filter || 'unresolved') : 'unresolved';
+			alertsPageByFilter[initFilter] = alertsPageByFilter[initFilter] || 1;
+			applyAlertTabFilter(initFilter);
+		}
+
+		document.getElementById('alertsPageSize')?.addEventListener('change', (event) => {
+			const value = parseInt(String(event.target.value || '5'), 10);
+			alertsPageSize = ALERTS_PAGE_SIZES.includes(value) ? value : 5;
+			const filter = getActiveAlertFilter();
+			alertsPageByFilter[filter] = 1;
+			applyAlertTabFilter(filter);
+		});
+
+		document.getElementById('alertsPaginationFirst')?.addEventListener('click', () => {
+			goToAlertsPage(1);
+		});
+
+		document.getElementById('alertsPaginationPrev')?.addEventListener('click', () => {
+			const filter = getActiveAlertFilter();
+			goToAlertsPage(Math.max(1, (alertsPageByFilter[filter] || 1) - 1));
+		});
+
+		document.getElementById('alertsPaginationNext')?.addEventListener('click', () => {
+			const filter = getActiveAlertFilter();
+			goToAlertsPage((alertsPageByFilter[filter] || 1) + 1);
+		});
+
+		document.getElementById('alertsPaginationLast')?.addEventListener('click', () => {
+			const filter = getActiveAlertFilter();
+			const matchingCount = Array.from(document.querySelectorAll('.alerts-table tbody tr'))
+				.filter((r) => r.id !== 'noResults' && rowMatchesAlertTab(r, filter))
+				.length;
+			const totalPages = Math.max(1, Math.ceil(matchingCount / alertsPageSize));
+			goToAlertsPage(totalPages);
+		});
+
+		// Modal handling -------------------------------------------------
+		function formatDateTime(iso) {
+			if (!iso) return ['-', ''];
+			const d = new Date(iso);
+			const optsDate = { month: 'short', day: '2-digit', year: 'numeric' };
+			const date = d.toLocaleDateString(undefined, optsDate);
+			const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+			return [date, time];
+		}
+
+		function getSeverityClass(severity) {
+			const s = String(severity || '').toLowerCase();
+			if (s === 'critical') return 'badge-pill badge-critical';
+			if (s === 'high') return 'badge-pill badge-high';
+			if (s === 'medium') return 'badge-pill badge-medium';
+			if (s === 'low') return 'badge-pill badge-low';
+			return 'badge-pill badge-medium';
+		}
+
+		function getStatusClass(status) {
+			return String(status || '').toLowerCase() === 'resolved'
+				? 'badge-pill badge-success'
+				: 'badge-pill badge-danger';
+		}
+
+		function getResolveSeverityStyle(severity) {
+			const s = String(severity || '').toLowerCase();
+			if (s === 'critical') return { background: '#fee2e2', color: '#b91c1c' };
+			if (s === 'high') return { background: '#ffedd5', color: '#c2410c' };
+			if (s === 'medium') return { background: '#fef3c7', color: '#92400e' };
+			if (s === 'low') return { background: '#e5e7eb', color: '#374151' };
+			return { background: '#fef3c7', color: '#92400e' };
+		}
+
+		function openAlertModal(alertId) {
+			const alert = ALERTS.find(a => String(a.alert_id) === String(alertId));
+			if (!alert) return;
+
+			const modal = document.getElementById('alertModal');
+			if (!modal) return;
+
+			// Populate alert information
+			const [date, time] = formatDateTime(alert.created_at);
+			modal.querySelector('#m_alert_id').textContent = alert.alert_id || '-';
+			modal.querySelector('#m_type').textContent = alert.alert_type || '-';
+			modal.querySelector('#m_message').textContent = alert.message || 'Visitor scanned at wrong office';
+			modal.querySelector('#m_created_at').textContent = `${date} ${time}`.trim();
+
+			const severityValue = alert.severity || 'Medium';
+			const severityEl = modal.querySelector('#m_severity');
+			severityEl.textContent = severityValue;
+			severityEl.className = getSeverityClass(severityValue);
+
+			const statusValue = alert.status || 'Unresolved';
+			const statusEl = modal.querySelector('#m_status');
+			statusEl.textContent = statusValue;
+			statusEl.className = getStatusClass(statusValue);
+
+			// Visitor
+			modal.querySelector('#m_visitor_name').textContent = ((alert.visitor && (alert.visitor.first_name || alert.visitor.last_name)) ? ((alert.visitor.first_name || '') + ' ' + (alert.visitor.last_name || '')).trim() : '-');
+			modal.querySelector('#m_pass_no').textContent = (alert.visit && alert.visit.pass_number) ? alert.visit.pass_number : (alert.pass_number || '-');
+			modal.querySelector('#m_control_no').textContent = (alert.visit && alert.visit.control_number) ? alert.visit.control_number : (alert.control_number || '-');
+			modal.querySelector('#m_contact').textContent = alert.visitor && alert.visitor.contact_no ? alert.visitor.contact_no : '-';
+
+			// Visit
+			const visitType = (alert.visit && alert.visit.visit_type)
+				? (Array.isArray(alert.visit.visit_type)
+					? (alert.visit.visit_type[0] && alert.visit.visit_type[0].visit_type_name)
+					: alert.visit.visit_type.visit_type_name)
+				: null;
+
+			const visitDuration = (alert.visit && alert.visit.duration_minutes !== undefined && alert.visit.duration_minutes !== null)
+				? `${alert.visit.duration_minutes} mins`
+				: '-';
+
+			modal.querySelector('#m_visit_id').textContent = alert.visit && alert.visit.visit_id ? alert.visit.visit_id : (alert.visit_id || '-');
+			modal.querySelector('#m_visit_type').textContent = visitType || (alert.visit && alert.visit.type ? alert.visit.type : (alert.visit_type || '-'));
+			modal.querySelector('#m_purpose').textContent = alert.visit && alert.visit.purpose_reason ? alert.visit.purpose_reason : (alert.visit && alert.visit.purpose ? alert.visit.purpose : (alert.purpose || '-'));
+
+			const [entryDate, entryTime] = formatDateTime(alert.visit && alert.visit.entry_time ? alert.visit.entry_time : null);
+			modal.querySelector('#m_entry_time').textContent = entryDate === '-' ? '-' : `${entryDate} ${entryTime}`;
+
+			const [exitDate, exitTime] = formatDateTime(alert.visit && alert.visit.exit_time ? alert.visit.exit_time : null);
+			modal.querySelector('#m_exit_time').textContent = exitDate === '-' ? '-' : `${exitDate} ${exitTime}`;
+			modal.querySelector('#m_duration').textContent = visitDuration;
+			modal.querySelector('#m_primary_office').textContent = (alert.visit && alert.visit.office && alert.visit.office.office_name)
+				? alert.visit.office.office_name
+				: ((alert.visit && alert.visit.destination_text) ? alert.visit.destination_text : (alert.visit && alert.visit.primary_office_id ? alert.visit.primary_office_id : '-'));
+
+			// Scan
+			const scannedBy = (alert.office_scan && alert.office_scan.users)
+				? (Array.isArray(alert.office_scan.users)
+					? `${alert.office_scan.users[0]?.first_name || ''} ${alert.office_scan.users[0]?.last_name || ''}`.trim()
+					: `${alert.office_scan.users.first_name || ''} ${alert.office_scan.users.last_name || ''}`.trim())
+				: null;
+
+			const validationStatus = (alert.office_scan && alert.office_scan.validation_status)
+				? (Array.isArray(alert.office_scan.validation_status)
+					? (alert.office_scan.validation_status[0]?.status_name || null)
+					: (alert.office_scan.validation_status.status_name || alert.office_scan.validation_status))
+				: null;
+
+			modal.querySelector('#m_scan_id').textContent = alert.office_scan && alert.office_scan.scan_id ? alert.office_scan.scan_id : (alert.scan_id || '-');
+			modal.querySelector('#m_scanned_office').textContent = alert.office_scan && alert.office_scan.office && alert.office_scan.office.office_name ? alert.office_scan.office.office_name : (alert.scanned_office || '-');
+			modal.querySelector('#m_scanned_by').textContent = scannedBy || (alert.office_scan && alert.office_scan.scanned_by ? alert.office_scan.scanned_by : (alert.scanned_by || '-'));
+			modal.querySelector('#m_scan_time').textContent = alert.office_scan && alert.office_scan.scan_time ? alert.office_scan.scan_time : time;
+			modal.querySelector('#m_validation_status').textContent = validationStatus || (alert.validation_status || 'Invalid');
+			modal.querySelector('#m_remarks').textContent = alert.office_scan && alert.office_scan.remarks ? alert.office_scan.remarks : (alert.remarks || 'Visitor entered incorrect office');
+
+			// Resolution
+			const resolvedByObj = alert.resolved_by
+				? (Array.isArray(alert.resolved_by) ? alert.resolved_by[0] : alert.resolved_by)
+				: null;
+			const resolvedBy = (resolvedByObj && (resolvedByObj.first_name || resolvedByObj.last_name))
+				? `${resolvedByObj.first_name || ''} ${resolvedByObj.last_name || ''}`.trim()
+				: (alert.resolved_by_name || '-');
+			const [resolvedDate, resolvedTime] = formatDateTime(alert.resolved_at || null);
+			const resolvedAtText = resolvedDate === '-' ? '-' : `${resolvedDate} ${resolvedTime}`;
+			const resolutionNotes = alert.resolution_notes || alert.resolution_note || alert.notes || 'Not yet resolved';
+			const isResolved = String(alert.status || '').toLowerCase() === 'resolved';
+
+			const unresolvedTextEl = modal.querySelector('#m_unresolved_text');
+			const resolvedDetailsEl = modal.querySelector('#m_resolved_details');
+			if (unresolvedTextEl && resolvedDetailsEl) {
+				unresolvedTextEl.style.display = isResolved ? 'none' : 'block';
+				resolvedDetailsEl.style.display = isResolved ? 'block' : 'none';
+			}
+
+			modal.querySelector('#m_resolved_by').textContent = resolvedBy;
+			modal.querySelector('#m_resolved_at').textContent = resolvedAtText;
+			modal.querySelector('#m_resolution_notes').textContent = isResolved ? resolutionNotes : '-';
+
+			// Attach resolve button dataset and hide it when alert is already resolved
+			const resolveBtn = modal.querySelector('#resolveAlertBtn');
+			if (resolveBtn) {
+				resolveBtn.dataset.alertId = alert.alert_id;
+				if (isResolved) {
+					// hide the resolve action if it's already resolved
+					resolveBtn.style.display = 'none';
+					resolveBtn.disabled = true;
+				} else {
+					resolveBtn.style.display = 'inline-block';
+					resolveBtn.disabled = false;
+				}
+			}
+
+			modal.classList.add('is-open');
+			modal.style.display = 'flex';
+		}
+
+		function closeAlertModal() {
+			const modal = document.getElementById('alertModal');
+			if (modal) {
+				modal.classList.remove('is-open');
+				modal.style.display = 'none';
+			}
+		}
+
+		function openResolveModal(alertId) {
+			const alert = ALERTS.find(a => String(a.alert_id) === String(alertId));
+			if (!alert) return;
+
+			const resolveModal = document.getElementById('resolveModal');
+			if (!resolveModal) return;
+
+			const visitorName = ((alert.visitor && (alert.visitor.first_name || alert.visitor.last_name))
+				? `${alert.visitor.first_name || ''} ${alert.visitor.last_name || ''}`.trim()
+				: '-');
+
+			const severity = alert.severity ? String(alert.severity) : 'Medium';
+
+			resolveModal.querySelector('#r_alert_id').textContent = alert.alert_id || '-';
+			resolveModal.querySelector('#r_visitor').textContent = visitorName;
+			resolveModal.querySelector('#r_alert_type').textContent = alert.alert_type || '-';
+			const severityEl = resolveModal.querySelector('#r_severity');
+			severityEl.textContent = severity;
+			const severityStyle = getResolveSeverityStyle(severity);
+			severityEl.style.backgroundColor = severityStyle.background;
+			severityEl.style.color = severityStyle.color;
+			resolveModal.querySelector('#resolveNotes').value = '';
+
+			pendingResolveAlertId = alert.alert_id;
+			resolveModal.classList.add('is-open');
+			resolveModal.style.display = 'flex';
+		}
+
+		function closeResolveModal() {
+			const resolveModal = document.getElementById('resolveModal');
+			if (resolveModal) {
+				resolveModal.classList.remove('is-open');
+				resolveModal.style.display = 'none';
+			}
+			pendingResolveAlertId = null;
+		}
+
+		async function resolveAlertClient(alertId, notes) {
+			if (!notes) {
+				alert('Please add Resolution Notes before resolving this alert.');
+				return;
+			}
+
+			// update ALERTS array
+			const idx = ALERTS.findIndex(a => String(a.alert_id) === String(alertId));
+			if (idx === -1) return;
+			const previousStatus = String(ALERTS[idx].status || '').toLowerCase();
+
+			try {
+				const response = await fetch(`/admin/alerts/${encodeURIComponent(alertId)}/resolve`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'Accept': 'application/json',
+						'X-CSRF-TOKEN': csrfToken,
+					},
+					body: JSON.stringify({ resolution_notes: notes }),
+				});
+
+				const payload = await response.json().catch(() => ({}));
+				if (!response.ok) {
+					throw new Error(payload.message || 'Failed to resolve alert.');
+				}
+
+				const updated = payload.alert || {};
+				ALERTS[idx] = {
+					...ALERTS[idx],
+					...updated,
+					status: updated.status || 'Resolved',
+					resolved_at: updated.resolved_at || new Date().toISOString(),
+					resolution_notes: updated.resolution_notes || notes,
+				};
+
+				if (Object.prototype.hasOwnProperty.call(updated, 'resolved_by')) {
+					ALERTS[idx].resolved_by = updated.resolved_by;
+				}
+			} catch (error) {
+				alert(error.message || 'Unable to resolve alert at the moment.');
+				return;
+			}
+
+			// update DOM row
+			const row = document.querySelector(`tr[data-alert-id="${alertId}"]`);
+			if (row) {
+				row.dataset.status = 'resolved';
+				row.dataset.resolvedAt = ALERTS[idx].resolved_at || new Date().toISOString();
+				const statusTd = row.querySelector('td:nth-last-child(2)');
+				if (statusTd) statusTd.innerHTML = '<span class="alert-pill status-resolved">Resolved</span>';
+			}
+
+			// update counts
+			const unresolvedEl = document.getElementById('unresolvedCount');
+			const resolvedEl = document.getElementById('resolvedCount');
+			const totalEl = document.getElementById('totalCount');
+			const criticalEl = document.getElementById('criticalCount');
+
+			const prevUn = parseInt(unresolvedEl.textContent || '0', 10);
+			const prevRes = parseInt(resolvedEl.textContent || '0', 10);
+			if (!isNaN(prevUn) && !isNaN(prevRes) && previousStatus !== 'resolved') {
+				unresolvedEl.textContent = Math.max(prevUn - 1, 0);
+				resolvedEl.textContent = prevRes + 1;
+			}
+
+			// update tab labels
+			const tabs = document.querySelectorAll('.panel-tabs .tab-link');
+			tabs.forEach(t => {
+				if (t.dataset.filter === 'unresolved') t.textContent = `Unresolved Alerts (${unresolvedEl.textContent})`;
+				if (t.dataset.filter === 'resolved') t.textContent = `Resolved (${resolvedEl.textContent})`;
+				if (t.dataset.filter === 'all') t.textContent = `All Alerts (${totalEl.textContent})`;
+			});
+
+			// reapply current filter so resolved row may hide if on unresolved tab
+			const active = document.querySelector('.panel-tabs .tab-link.active');
+			if (active) applyAlertTabFilter(active.dataset.filter || 'all');
+
+			closeResolveModal();
+			closeAlertModal();
+		}
+
+		// Attach click handlers to dynamic buttons
+		document.addEventListener('click', async function (e) {
+			if (e.target && e.target.matches('.view-btn')) {
+				const id = e.target.dataset.alertId;
+				openAlertModal(id);
+			}
+			if (e.target && (e.target.matches('#closeAlertBtn') || e.target.matches('.js-close-alert') || e.target.id === 'alertModal')) {
+				closeAlertModal();
+			}
+			if (e.target && e.target.matches('#resolveAlertBtn')) {
+				const id = e.target.dataset.alertId;
+				openResolveModal(id);
+			}
+			if (e.target && (e.target.matches('#closeResolveModalBtn') || e.target.matches('#cancelResolveBtn'))) {
+				closeResolveModal();
+			}
+			if (e.target && e.target.id === 'resolveModal') {
+				closeResolveModal();
+			}
+			if (e.target && e.target.matches('#confirmResolveBtn')) {
+				if (!pendingResolveAlertId) return;
+				const notesEl = document.getElementById('resolveNotes');
+				const notes = notesEl ? notesEl.value.trim() : '';
+				const confirmBtn = e.target;
+				confirmBtn.disabled = true;
+				confirmBtn.textContent = 'Resolving...';
+				await resolveAlertClient(pendingResolveAlertId, notes);
+				confirmBtn.disabled = false;
+				confirmBtn.textContent = 'Resolve';
+			}
+		});
+	</script>
+	@include('partials.live-auto-refresh')
+	@include('admin.partials.admin-responsive-script')
+</body>
+</html>

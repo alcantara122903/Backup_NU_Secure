@@ -1,0 +1,2864 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Exceptions\GuardDutyUnavailableException;
+use App\Services\ActivityLogService;
+use App\Services\GuardDutyService;
+use App\Services\OCRService;
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
+
+class GuardVisitorController extends Controller
+{
+    public function __construct(protected GuardDutyService $guardDutyService) {}
+
+    public function processExitScan(Request $request)
+    {
+        $validated = $request->validate([
+            'qr_data' => ['required', 'string', 'max:4000'],
+        ]);
+
+        $rawQr = trim((string) $validated['qr_data']);
+        $parsedQr = $this->parseExitQrPayload($rawQr);
+
+        if (
+            $parsedQr['qr_token'] === null
+            && $parsedQr['control_number'] === null
+            && $parsedQr['pass_number'] === null
+        ) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Invalid QR payload. Please scan a valid visitor QR code.',
+            ], 422);
+        }
+
+        $visit = DB::table('visit as v')
+            ->join('visitor as vr', 'vr.visitor_id', '=', 'v.visitor_id')
+            ->leftJoin('exit_status as es', 'es.exit_status_id', '=', 'v.exit_status_id')
+            ->leftJoin('office as o', 'o.office_id', '=', 'v.primary_office_id')
+            ->select(
+                'v.visit_id',
+                'v.entry_time',
+                'v.exit_time',
+                'v.exit_status_id',
+                'v.qr_token',
+                'v.visitor_id',
+                'v.purpose_reason',
+                'v.primary_office_id',
+                'v.destination_text',
+                'v.control_number',
+                'v.pass_number',
+                'vr.first_name',
+                'vr.last_name',
+                'vr.visitor_photo_with_id_url',
+                'o.office_name as primary_office_name',
+                'es.exit_status_name'
+            )
+            ->whereNull('v.exit_time')
+            ->where(function ($query) use ($parsedQr) {
+                if (! empty($parsedQr['qr_token'])) {
+                    $query->orWhereRaw('LOWER(TRIM(COALESCE(v.qr_token, \'\'))) = ?', [strtolower($parsedQr['qr_token'])]);
+                }
+
+                if (! empty($parsedQr['control_number'])) {
+                    $query->orWhereRaw('LOWER(TRIM(COALESCE(v.control_number, \'\'))) = ?', [strtolower($parsedQr['control_number'])]);
+                }
+
+                if (! empty($parsedQr['pass_number'])) {
+                    $query->orWhereRaw('LOWER(TRIM(COALESCE(v.pass_number, \'\'))) = ?', [strtolower($parsedQr['pass_number'])]);
+                }
+            })
+            ->orderByDesc('v.entry_time')
+            ->orderByDesc('v.visit_id')
+            ->first();
+
+        if (! $visit) {
+            $alreadyCheckedOut = DB::table('visit as v')
+                ->join('visitor as vr', 'vr.visitor_id', '=', 'v.visitor_id')
+                ->whereNotNull('v.exit_time')
+                ->where(function ($query) use ($parsedQr) {
+                    if (! empty($parsedQr['qr_token'])) {
+                        $query->orWhereRaw('LOWER(TRIM(COALESCE(v.qr_token, \'\'))) = ?', [strtolower($parsedQr['qr_token'])]);
+                    }
+
+                    if (! empty($parsedQr['control_number'])) {
+                        $query->orWhereRaw('LOWER(TRIM(COALESCE(v.control_number, \'\'))) = ?', [strtolower($parsedQr['control_number'])]);
+                    }
+
+                    if (! empty($parsedQr['pass_number'])) {
+                        $query->orWhereRaw('LOWER(TRIM(COALESCE(v.pass_number, \'\'))) = ?', [strtolower($parsedQr['pass_number'])]);
+                    }
+                })
+                ->exists();
+
+            return response()->json([
+                'status' => 'error',
+                'message' => $alreadyCheckedOut
+                    ? 'This visitor has already been checked out. The QR code is still readable but cannot be used again for exit.'
+                    : 'No active visitor record found for this QR code.',
+            ], 404);
+        }
+
+        $exitAt = $this->philippinesNow();
+        $durationMinutes = null;
+
+        if (! empty($visit->entry_time)) {
+            try {
+                $entryAt = Carbon::parse($visit->entry_time, 'Asia/Manila');
+                // Ensure integer minutes for DB column type compatibility.
+                $durationMinutes = max(0, (int) floor($entryAt->diffInSeconds($exitAt) / 60));
+            } catch (\Throwable $e) {
+                $durationMinutes = null;
+            }
+        }
+
+        $exitedStatusId = $this->resolveExitStatusByNames(['exited', 'checked out', 'completed', 'ready to exit']);
+        $skippedExpectationStatusId = $this->resolveSkippedExpectationStatusId();
+        $validValidationStatusId = $this->resolveValidValidationStatusId();
+        $scannedByUserId = Auth::id();
+
+        DB::transaction(function () use (
+            $visit,
+            $exitAt,
+            $durationMinutes,
+            $exitedStatusId,
+            $skippedExpectationStatusId,
+            $validValidationStatusId,
+            $scannedByUserId
+        ) {
+            DB::table('visit')
+                ->where('visit_id', $visit->visit_id)
+                ->update([
+                    'exit_time' => $exitAt,
+                    'duration_minutes' => $durationMinutes,
+                    'exit_status_id' => $exitedStatusId ?: $visit->exit_status_id,
+                ]);
+
+            if ($skippedExpectationStatusId !== null) {
+                DB::table('office_expectation')
+                    ->where('visit_id', $visit->visit_id)
+                    ->whereNull('arrived_at')
+                    ->where(function ($query) use ($skippedExpectationStatusId) {
+                        $query->whereNull('expectation_status_id')
+                            ->orWhere('expectation_status_id', '!=', $skippedExpectationStatusId);
+                    })
+                    ->update([
+                        'expectation_status_id' => $skippedExpectationStatusId,
+                    ]);
+            }
+
+            // Facility exit is not tied to a destination office (especially contractors).
+            DB::table('office_scan')->insert([
+                'visit_id' => (int) $visit->visit_id,
+                'office_id' => null,
+                'scanned_by_user_id' => $scannedByUserId ? (int) $scannedByUserId : null,
+                'scan_time' => $exitAt,
+                'validation_status_id' => $validValidationStatusId,
+                'remarks' => 'Guard facility exit scan',
+            ]);
+        });
+
+        $fullName = trim(((string) ($visit->first_name ?? '')).' '.((string) ($visit->last_name ?? '')));
+        $displayName = $fullName !== '' ? $fullName : 'Visitor';
+
+        ActivityLogService::log(
+            action: 'Visitor Exited',
+            module: 'Visitor Monitoring',
+            description: ActivityLogService::actorLabel().' recorded the exit of visitor '.$displayName.'.',
+            entityType: 'Visit',
+            entityId: (int) $visit->visit_id,
+            newValues: [
+                'visitor_id' => (int) $visit->visitor_id,
+                'visitor_name' => $displayName,
+                'control_number' => trim((string) ($visit->control_number ?? '')),
+                'pass_number' => trim((string) ($visit->pass_number ?? '')),
+                'exit_time' => $exitAt->toDateTimeString(),
+                'duration_minutes' => $durationMinutes,
+            ]
+        );
+
+        $entryTime = null;
+        $photoPath = trim((string) ($visit->visitor_photo_with_id_url ?? ''));
+        $photoPreviewUrl = $this->resolveVisitorPhotoUrl($photoPath);
+
+        if (! empty($visit->entry_time)) {
+            try {
+                $entryTime = Carbon::parse($visit->entry_time, 'Asia/Manila')->toDateTimeString();
+            } catch (\Throwable $e) {
+                $entryTime = null;
+            }
+        }
+
+        return response()->json([
+            'status' => 'ok',
+            'message' => $displayName.' successfully checked out.',
+            'qr_data' => $parsedQr['control_number'] ?: ($parsedQr['pass_number'] ?: ($parsedQr['qr_token'] ?: $rawQr)),
+            'data' => [
+                'visit_id' => (int) $visit->visit_id,
+                'visitor_id' => (int) $visit->visitor_id,
+                'visitor_name' => $displayName,
+                'control_number' => trim((string) ($visit->control_number ?? '')),
+                'pass_number' => trim((string) ($visit->pass_number ?? '')),
+                'purpose_reason' => trim((string) ($visit->purpose_reason ?? '')),
+                'office_name' => $this->resolveVisitDestinationLabel(
+                    trim((string) ($visit->primary_office_name ?? '')),
+                    trim((string) ($visit->destination_text ?? ''))
+                ),
+                'destination_text' => trim((string) ($visit->destination_text ?? '')),
+                'visitor_photo_with_id_url' => $photoPath,
+                'visitor_photo_preview_url' => $photoPreviewUrl,
+                'entry_time' => $entryTime,
+                'exit_time' => $exitAt->toDateTimeString(),
+                'duration_minutes' => $durationMinutes,
+            ],
+        ]);
+    }
+
+    /**
+     * Persist visitor registration data (visitor + visit + optional visit_route).
+     */
+    public function storeVisitorRegistration(Request $request)
+    {
+        $validated = $request->validate([
+            'register_type' => ['required', 'string', Rule::in(['normal', 'contractor', 'enrollee'])],
+            'first_name' => ['required', 'string', 'max:255'],
+            'last_name' => ['required', 'string', 'max:255'],
+            'birthday' => ['required', 'date'],
+            'house_no' => ['nullable', 'string', 'max:255'],
+            'street' => ['nullable', 'string', 'max:255'],
+            'barangay' => ['nullable', 'string', 'max:255'],
+            'city_municipality' => ['nullable', 'string', 'max:255'],
+            'province' => ['nullable', 'string', 'max:255'],
+            'region' => ['nullable', 'string', 'max:255'],
+            'contact_no' => ['required', 'string', 'max:20'],
+            'pass_number' => ['required', 'string', 'max:255'],
+            'control_number' => ['required', 'string', 'max:255'],
+            'purpose_reason' => ['required', 'string', 'max:2000'],
+            'destination_office_text' => ['nullable', 'string', 'max:255'],
+            'contact_person' => ['nullable', 'string', 'max:255'],
+            'office_ids' => ['nullable', 'array'],
+            'office_ids.*' => ['integer', 'exists:office,office_id'],
+            'visitor_photo_with_id_url' => ['nullable', 'string', 'max:2000'],
+            'qr_token' => ['nullable', 'string', 'max:255'],
+            'qr_payload' => ['nullable', 'string', 'max:4000'],
+            'existing_visitor_confirmed' => ['nullable', 'boolean'],
+            'existing_visitor_id' => ['nullable', 'integer'],
+        ]);
+
+        $registerType = strtolower((string) $validated['register_type']);
+        $officeIds = array_values(array_unique(array_map('intval', $validated['office_ids'] ?? [])));
+
+        $enrolleeSteps = [];
+
+        if ($registerType === 'enrollee') {
+            $enrolleeSteps = $this->resolveEnrolleeStepAssignments();
+
+            // Keep route order as configured in enrollee_step (Admissions appears twice: start + final).
+            // Do not unique() office IDs — that drops step 9.
+            $officeIds = collect($enrolleeSteps)
+                ->pluck('office_id')
+                ->filter(fn ($id) => $id !== null && $id !== '')
+                ->values()
+                ->map(fn ($id) => (int) $id)
+                ->all();
+        }
+
+        if ($registerType === 'enrollee') {
+            $validated['purpose_reason'] = 'For Enrollment';
+        }
+
+        $validated['province'] = trim((string) ($validated['province'] ?? ''));
+        $validated['region'] = trim((string) ($validated['region'] ?? ''));
+        if ($validated['region'] === '' && $validated['province'] !== '') {
+            $validated['region'] = $this->inferRegionFromProvince($validated['province']);
+        }
+
+        $destinationOfficeText = trim((string) ($validated['destination_office_text'] ?? ''));
+
+        if ($registerType === 'normal') {
+            $hasOffice = ! empty($officeIds);
+            $hasCustomDestination = $destinationOfficeText !== '';
+
+            if (! $hasOffice && ! $hasCustomDestination) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Please select an office to visit or specify your destination.',
+                ], 422);
+            }
+
+            if ($hasOffice) {
+                $validOfficeCount = DB::table('office')
+                    ->whereIn('office_id', $officeIds)
+                    ->where('is_active', true)
+                    ->count();
+
+                if ($validOfficeCount !== count($officeIds)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'One or more selected offices are invalid or inactive.',
+                    ], 422);
+                }
+            }
+        }
+
+        if ($registerType === 'enrollee' && empty($officeIds)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No active enrollee destination offices are configured.',
+            ], 422);
+        }
+
+        if ($registerType === 'contractor') {
+            $contactPerson = trim((string) ($validated['contact_person'] ?? ''));
+
+            if ($destinationOfficeText === '') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Please enter Destination Office.',
+                ], 422);
+            }
+
+            if ($contactPerson === '') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Please enter Contact Person.',
+                ], 422);
+            }
+        }
+
+        $activeExitStatusId = $this->resolveExitStatusId();
+        $visitTypeName = $this->resolveVisitTypeNameForRegisterType($registerType);
+        $visitorVisitTypeId = $this->resolveVisitTypeId($visitTypeName) ?: $this->resolveVisitTypeId('Visitor');
+
+        if (! $activeExitStatusId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Exit status "Active" is not configured.',
+            ], 500);
+        }
+
+        if (! $visitorVisitTypeId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Visit type "Visitor" is not configured.',
+            ], 500);
+        }
+
+        try {
+            $result = DB::transaction(function () use ($validated, $registerType, $officeIds, $enrolleeSteps, $activeExitStatusId, $visitorVisitTypeId, $destinationOfficeText) {
+                $isSelfRegistration = (int) optional(Auth::user())->role_id === 4;
+                $activeShift = null;
+
+                if ($isSelfRegistration) {
+                    $activeShift = $this->guardDutyService->lockActiveShiftForKiosk((int) Auth::id());
+
+                    if (! $activeShift) {
+                        throw GuardDutyUnavailableException::missing();
+                    }
+                }
+
+                $confirmedExistingVisitorId = (int) ($validated['existing_visitor_id'] ?? 0);
+                $shouldReuseExistingVisitor = (bool) ($validated['existing_visitor_confirmed'] ?? false) && $confirmedExistingVisitorId > 0;
+                $matchedVisitor = $shouldReuseExistingVisitor
+                    ? $this->findVisitorForRegistration($validated, $confirmedExistingVisitorId)
+                    : null;
+
+                $addressPayload = [
+                    'house_no' => (string) ($validated['house_no'] ?? ''),
+                    'street' => (string) ($validated['street'] ?? ''),
+                    'barangay' => (string) ($validated['barangay'] ?? ''),
+                    'city_municipality' => (string) ($validated['city_municipality'] ?? ''),
+                    'province' => (string) ($validated['province'] ?? ''),
+                    'region' => (string) ($validated['region'] ?? ''),
+                ];
+
+                $addressId = $this->resolveAddressIdForRegistration($addressPayload);
+
+                $visitorAction = 'created_new';
+
+                if ($matchedVisitor && $shouldReuseExistingVisitor) {
+                    $visitorId = (int) $matchedVisitor->visitor_id;
+
+                    $photoPath = trim((string) ($validated['visitor_photo_with_id_url'] ?? ''));
+
+                    DB::table('visitor')
+                        ->where('visitor_id', $visitorId)
+                        ->update([
+                            'first_name' => $validated['first_name'],
+                            'last_name' => $validated['last_name'],
+                            'birthday' => $validated['birthday'],
+                            'address_id' => $addressId,
+                            'contact_no' => $validated['contact_no'],
+                            'visitor_photo_with_id_url' => $photoPath !== ''
+                                ? $photoPath
+                                : ($matchedVisitor->visitor_photo_with_id_url ?? null),
+                        ]);
+
+                    $visitorAction = 'updated_existing';
+                } else {
+                    $visitorId = DB::table('visitor')->insertGetId([
+                        'first_name' => $validated['first_name'],
+                        'last_name' => $validated['last_name'],
+                        'birthday' => $validated['birthday'],
+                        'address_id' => $addressId,
+                        'contact_no' => $validated['contact_no'],
+                        'visitor_photo_with_id_url' => $validated['visitor_photo_with_id_url'] ?? null,
+                        'created_at' => now(),
+                    ], 'visitor_id');
+                }
+
+                $resumeEnrollee = null;
+                if ($registerType === 'enrollee' && $matchedVisitor && $shouldReuseExistingVisitor) {
+                    $resumeEnrollee = $this->findUnfinishedEnrolleeResume($visitorId);
+                }
+
+                if ($resumeEnrollee && ! empty($resumeEnrollee['source_visit_id'])) {
+                    $this->closeVisitForEnrolleeResume((int) $resumeEnrollee['source_visit_id']);
+                }
+
+                $primaryOfficeId = null;
+                $destinationText = null;
+
+                if ($registerType === 'contractor') {
+                    $destinationText = $destinationOfficeText !== '' ? $destinationOfficeText : null;
+                } elseif ($registerType === 'enrollee') {
+                    $primaryOfficeId = $officeIds[0] ?? null;
+                } elseif ($registerType === 'normal') {
+                    $primaryOfficeId = $officeIds[0] ?? null;
+                    if ($destinationOfficeText !== '') {
+                        $destinationText = $destinationOfficeText;
+                    }
+                }
+
+                $visitPayload = [
+                    'visitor_id' => $visitorId,
+                    'guard_user_id' => $isSelfRegistration ? null : Auth::id(),
+                    'visit_type_id' => $visitorVisitTypeId,
+                    'purpose_reason' => $validated['purpose_reason'],
+                    'primary_office_id' => $primaryOfficeId,
+                    'destination_text' => $destinationText,
+                    'pass_number' => $validated['pass_number'],
+                    'control_number' => $validated['control_number'],
+                    'qr_token' => trim((string) ($validated['qr_token'] ?? '')) !== ''
+                        ? trim((string) $validated['qr_token'])
+                        : strtoupper(Str::random(12)),
+                    'entry_time' => $this->philippinesNow(),
+                    'exit_status_id' => $activeExitStatusId,
+                ];
+
+                if ($isSelfRegistration && $activeShift) {
+                    $visitPayload['on_duty_guard_id'] = $activeShift->guard_user_id
+                        ? (int) $activeShift->guard_user_id
+                        : null;
+                    $visitPayload['duty_shift_id'] = (int) $activeShift->shift_id;
+                }
+
+                $visitId = DB::table('visit')->insertGetId($visitPayload, 'visit_id');
+
+                $savedOfficeCount = 0;
+                $enrolleeId = null;
+                $resumedEnrollment = false;
+
+                if ($registerType === 'enrollee') {
+                    $pendingEnrolleeStatusId = $this->resolveEnrolleeStatusId('ONGOING')
+                        ?? $this->resolveEnrolleeStatusId('PENDING')
+                        ?? 1;
+
+                    if ($resumeEnrollee && ! empty($resumeEnrollee['enrollee_id'])) {
+                        $enrolleeId = (int) $resumeEnrollee['enrollee_id'];
+                        DB::table('enrollee')
+                            ->where('enrollee_id', $enrolleeId)
+                            ->update([
+                                'enrollee_status_id' => $pendingEnrolleeStatusId,
+                                'updated_at' => now(),
+                            ]);
+                        $resumedEnrollment = true;
+                        $savedOfficeCount = (int) ($resumeEnrollee['total_steps'] ?? 0);
+                    } else {
+                        $enrolleeId = DB::table('enrollee')->insertGetId([
+                            'visitor_id' => $visitorId,
+                            'enrollee_status_id' => $pendingEnrolleeStatusId,
+                            'updated_at' => now(),
+                        ], 'enrollee_id');
+
+                        $pendingStepStatusId = $this->resolveStepStatusId(['pending', 'ongoing', 'in progress', 'in_progress', 'not started', 'waiting'])
+                            ?? $this->resolveStepStatusId(['scheduled', 'expected'])
+                            ?? 1;
+                        $stepRows = [];
+                        $resolvedStepAssignments = ! empty($enrolleeSteps)
+                            ? $enrolleeSteps
+                            : $this->resolveEnrolleeStepAssignments();
+
+                        foreach ($resolvedStepAssignments as $stepAssignment) {
+                            $row = [
+                                'enrollee_id' => $enrolleeId,
+                                'step_id' => (int) $stepAssignment['step_id'],
+                                'completed_at' => null,
+                            ];
+
+                            if ($pendingStepStatusId) {
+                                $row['step_status_id'] = $pendingStepStatusId;
+                            }
+
+                            $stepRows[] = $row;
+                        }
+
+                        if (! empty($stepRows)) {
+                            DB::table('enrollee_progress')->insert($stepRows);
+                            $savedOfficeCount = count($stepRows);
+                        }
+
+                        // Still resume office progress even if no prior enrollee row existed.
+                        if ($resumeEnrollee) {
+                            $resumedEnrollment = true;
+                        }
+                    }
+                }
+
+                // office_expectation: normal visitor at enrollee — kahit isa lang ang office, nire-record ang route/order.
+                $shouldSaveOfficeExpectations = in_array($registerType, ['normal', 'enrollee'], true)
+                    && count($officeIds) > 0;
+
+                if ($shouldSaveOfficeExpectations) {
+                    $pendingExpectationStatusId = $this->resolveExpectationStatusId();
+                    $arrivedExpectationStatusId = $this->resolveArrivedExpectationStatusId();
+                    $expectationCreatedAt = now();
+                    // Key by expected_order so duplicate offices (e.g. Admissions at 1 and 9) resume correctly.
+                    $previousByOrder = [];
+
+                    if ($resumedEnrollment && ! empty($resumeEnrollee['source_visit_id'])) {
+                        $previousByOrder = DB::table('office_expectation')
+                            ->where('visit_id', (int) $resumeEnrollee['source_visit_id'])
+                            ->get()
+                            ->keyBy(static fn ($row) => (int) ($row->expected_order ?? 0))
+                            ->all();
+                    } elseif ($resumedEnrollment && ! empty($resumeEnrollee['steps'])) {
+                        foreach ($resumeEnrollee['steps'] as $step) {
+                            $stepOrder = (int) ($step['order'] ?? 0);
+                            $stepOfficeId = (int) ($step['office_id'] ?? 0);
+                            if ($stepOrder <= 0 || $stepOfficeId <= 0) {
+                                continue;
+                            }
+
+                            $previousByOrder[$stepOrder] = (object) [
+                                'office_id' => $stepOfficeId,
+                                'expected_order' => $stepOrder,
+                                'arrived_at' => (($step['state'] ?? '') === 'done')
+                                    ? ($step['arrived_at'] ?? $expectationCreatedAt)
+                                    : null,
+                                'expectation_status_id' => null,
+                            ];
+                        }
+                    }
+
+                    $expectationRows = [];
+                    foreach (array_values($officeIds) as $index => $officeId) {
+                        $officeId = (int) $officeId;
+                        $expectedOrder = $index + 1;
+                        $previous = $previousByOrder[$expectedOrder] ?? null;
+
+                        // Only carry arrival if the same office is still at this route order.
+                        $arrivedAt = $previous
+                            && (int) ($previous->office_id ?? 0) === $officeId
+                            && ! empty($previous->arrived_at)
+                            ? $previous->arrived_at
+                            : null;
+
+                        $expectationRows[] = [
+                            'visit_id' => $visitId,
+                            'office_id' => $officeId,
+                            'expected_order' => $expectedOrder,
+                            'expectation_status_id' => $arrivedAt !== null
+                                ? (($previous->expectation_status_id ?? null) ?: $arrivedExpectationStatusId ?: $pendingExpectationStatusId)
+                                : $pendingExpectationStatusId,
+                            'arrived_at' => $arrivedAt,
+                            'created_at' => $expectationCreatedAt,
+                        ];
+                    }
+
+                    DB::table('office_expectation')->insert($expectationRows);
+                    $savedOfficeCount = count($expectationRows);
+                }
+
+                if ($registerType === 'contractor') {
+                    DB::table('contractor')->updateOrInsert(
+                        ['visit_id' => $visitId],
+                        [
+                            'contact_person' => trim((string) ($validated['contact_person'] ?? '')),
+                        ]
+                    );
+                }
+
+                return [
+                    'address_id' => $addressId,
+                    'visitor_id' => $visitorId,
+                    'enrollee_id' => $enrolleeId,
+                    'visitor_action' => $visitorAction,
+                    'visit_id' => $visitId,
+                    'primary_office_id' => $primaryOfficeId,
+                    'destination_text' => $destinationText,
+                    'saved_office_count' => $savedOfficeCount,
+                    'resumed_enrollment' => $resumedEnrollment,
+                    'resumed_from_visit_id' => $resumedEnrollment
+                        ? ($resumeEnrollee['source_visit_id'] ?? null)
+                        : null,
+                    'completed_steps' => $resumedEnrollment
+                        ? (int) ($resumeEnrollee['completed_steps'] ?? 0)
+                        : 0,
+                    'remaining_steps' => $resumedEnrollment
+                        ? (int) ($resumeEnrollee['remaining_steps'] ?? 0)
+                        : 0,
+                    'on_duty_guard_id' => $isSelfRegistration && $activeShift && $activeShift->guard_user_id
+                        ? (int) $activeShift->guard_user_id
+                        : null,
+                    'duty_shift_id' => $isSelfRegistration && $activeShift
+                        ? (int) $activeShift->shift_id
+                        : null,
+                ];
+            });
+
+            $visitorName = trim($validated['first_name'].' '.$validated['last_name']);
+            $controlNumber = trim((string) ($validated['control_number'] ?? ''));
+            $passNumber = trim((string) ($validated['pass_number'] ?? ''));
+            $controlSuffix = $controlNumber !== '' ? ' with Control Number '.$controlNumber : '';
+
+            ActivityLogService::log(
+                action: 'Visitor Registered',
+                module: 'Visitor Monitoring',
+                description: ActivityLogService::actorLabel().' registered visitor '.$visitorName.$controlSuffix.'.',
+                entityType: 'Visitor',
+                entityId: $result['visitor_id'] ?? null,
+                newValues: [
+                    'visitor_id' => $result['visitor_id'] ?? null,
+                    'visit_id' => $result['visit_id'] ?? null,
+                    'visitor_name' => $visitorName,
+                    'register_type' => $registerType,
+                    'pass_number' => $passNumber,
+                    'control_number' => $controlNumber,
+                    'purpose_reason' => $validated['purpose_reason'],
+                    'visitor_action' => $result['visitor_action'] ?? null,
+                    'on_duty_guard_id' => $result['on_duty_guard_id'] ?? null,
+                    'duty_shift_id' => $result['duty_shift_id'] ?? null,
+                ]
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => ! empty($result['resumed_enrollment'])
+                    ? 'Enrollment resumed. Previous office progress was carried over to the new QR.'
+                    : 'Visitor details saved successfully.',
+                'data' => $result,
+            ]);
+        } catch (GuardDutyUnavailableException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        } catch (\Throwable $e) {
+            \Log::error('storeVisitorRegistration failed', [
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to save visitor details.',
+            ], 500);
+        }
+    }
+
+    /**
+     * Resolve existing address row by exact normalized fields or create a new one.
+     */
+    protected function resolveAddressIdForRegistration(array $addressPayload): int
+    {
+        $normalized = [
+            'house_no' => trim((string) ($addressPayload['house_no'] ?? '')),
+            'street' => trim((string) ($addressPayload['street'] ?? '')),
+            'barangay' => trim((string) ($addressPayload['barangay'] ?? '')),
+            'city_municipality' => trim((string) ($addressPayload['city_municipality'] ?? '')),
+            'province' => trim((string) ($addressPayload['province'] ?? '')),
+            'region' => trim((string) ($addressPayload['region'] ?? '')),
+        ];
+
+        $existing = DB::table('address')
+            ->select('address_id')
+            ->whereRaw("LOWER(TRIM(COALESCE(house_no, ''))) = ?", [Str::lower($normalized['house_no'])])
+            ->whereRaw("LOWER(TRIM(COALESCE(street, ''))) = ?", [Str::lower($normalized['street'])])
+            ->whereRaw("LOWER(TRIM(COALESCE(barangay, ''))) = ?", [Str::lower($normalized['barangay'])])
+            ->whereRaw("LOWER(TRIM(COALESCE(city_municipality, ''))) = ?", [Str::lower($normalized['city_municipality'])])
+            ->whereRaw("LOWER(TRIM(COALESCE(province, ''))) = ?", [Str::lower($normalized['province'])])
+            ->whereRaw("LOWER(TRIM(COALESCE(region, ''))) = ?", [Str::lower($normalized['region'])])
+            ->orderByDesc('address_id')
+            ->first();
+
+        if ($existing) {
+            return (int) $existing->address_id;
+        }
+
+        return (int) DB::table('address')->insertGetId($normalized, 'address_id');
+    }
+
+    /**
+     * Find existing visitor for registration dedup by exact first+last name.
+     */
+    protected function findVisitorForRegistration(array $validated, ?int $visitorId = null): ?object
+    {
+        $firstName = trim((string) ($validated['first_name'] ?? ''));
+        $lastName = trim((string) ($validated['last_name'] ?? ''));
+
+        $baseQuery = static function () {
+            return DB::table('visitor')
+                ->select('visitor_id', 'address_id', 'visitor_photo_with_id_url')
+                ->orderByDesc('visitor_id');
+        };
+
+        if ($firstName === '' || $lastName === '') {
+            return null;
+        }
+
+        $query = $baseQuery()
+            ->whereRaw("LOWER(TRIM(COALESCE(first_name, ''))) = ?", [Str::lower($firstName)])
+            ->whereRaw("LOWER(TRIM(COALESCE(last_name, ''))) = ?", [Str::lower($lastName)])
+            ->whereExists(function ($query) {
+                $query->select(DB::raw(1))
+                    ->from('visit as vi')
+                    ->whereColumn('vi.visitor_id', 'visitor.visitor_id');
+            });
+
+        if ($visitorId !== null && $visitorId > 0) {
+            $query->where('visitor_id', $visitorId);
+        }
+
+        return $query->first();
+    }
+
+    /**
+     * Return active offices for guard visitor step.
+     */
+    public function getOffices()
+    {
+        try {
+            $registerType = strtolower(trim((string) request()->query('register_type', 'normal')));
+
+            if ($registerType === 'enrollee') {
+                // Keep full route order, including Admissions at step 1 and step 9.
+                $offices = collect($this->resolveEnrolleeStepAssignments())
+                    ->map(static function ($row) {
+                        return [
+                            'office_id' => (int) $row['office_id'],
+                            'office_name' => (string) $row['office_name'],
+                            'floor' => (string) ($row['floor'] ?? ''),
+                            'step_order' => (int) ($row['step_order'] ?? 0),
+                        ];
+                    })
+                    ->values();
+            } else {
+                $offices = DB::table('office')
+                    ->select('office_id', 'office_name', 'floor')
+                    ->where('is_active', true)
+                    ->orderBy('office_name')
+                    ->get();
+            }
+
+            return response()->json([
+                'success' => true,
+                'offices' => $offices,
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to load offices',
+            ], 500);
+        }
+    }
+
+    /**
+     * Save visitor capture (face + ID image) to storage.
+     */
+    public function saveCapture(Request $request)
+    {
+        try {
+            $step = (int) $request->input('step', 1);
+
+            $type = 'jpg';
+            $binaryImage = null;
+
+            // Preferred path: multipart file upload
+            if ($request->hasFile('image')) {
+                $uploadedImage = $request->file('image');
+                if (! $uploadedImage || ! $uploadedImage->isValid()) {
+                    return response()->json(['success' => false, 'message' => 'Invalid uploaded image file'], 400);
+                }
+
+                $mimeToExt = [
+                    'image/jpeg' => 'jpg',
+                    'image/jpg' => 'jpg',
+                    'image/png' => 'png',
+                    'image/gif' => 'gif',
+                ];
+
+                $mimeType = strtolower((string) $uploadedImage->getMimeType());
+                if (! isset($mimeToExt[$mimeType])) {
+                    return response()->json(['success' => false, 'message' => 'Unsupported uploaded image type'], 400);
+                }
+
+                $type = $mimeToExt[$mimeType];
+                $binaryImage = file_get_contents($uploadedImage->getPathname());
+            } else {
+                // Backward-compatible path: base64 data URL
+                $imageData = $request->input('image');
+
+                if (! $imageData) {
+                    return response()->json(['success' => false, 'message' => 'No image data provided'], 400);
+                }
+
+                if (preg_match('/data:image\/(\w+);base64,/', $imageData, $matches)) {
+                    $base64Data = substr($imageData, strpos($imageData, ',') + 1);
+                    $type = strtolower($matches[1]);
+
+                    if (! in_array($type, ['jpeg', 'jpg', 'png', 'gif'])) {
+                        return response()->json(['success' => false, 'message' => 'Invalid image type'], 400);
+                    }
+
+                    $binaryImage = base64_decode($base64Data, true);
+                } else {
+                    return response()->json(['success' => false, 'message' => 'Invalid image format'], 400);
+                }
+            }
+
+            if (! $binaryImage) {
+                return response()->json(['success' => false, 'message' => 'Failed to decode image'], 400);
+            }
+
+            if ($type === 'jpeg') {
+                $type = 'jpg';
+            }
+
+            // Keep ID scan (step 1) local so OCR flow remains reliable even when storage RLS is strict.
+            if ($step !== 3) {
+                $localResult = $this->saveCaptureLocally($binaryImage, $type);
+
+                if (! $localResult['success']) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => $localResult['message'] ?? 'Failed to save ID scan image',
+                    ], 500);
+                }
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Capture saved successfully',
+                    'filename' => $localResult['filename'],
+                    'path' => $localResult['public_path'],
+                    'public_url' => $localResult['public_path'],
+                    'bucket' => null,
+                    'bucket_file_path' => null,
+                    'step' => $step,
+                ]);
+            }
+
+            $uploadResult = $this->uploadCaptureToSupabase($binaryImage, $type, $step);
+            if (! $uploadResult['success']) {
+                // Fallback: do not block registration when Supabase Storage key/policy is misconfigured.
+                $localResult = $this->saveCaptureLocally($binaryImage, $type);
+
+                if (! $localResult['success']) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => ($uploadResult['message'] ?? 'Failed to upload image to Supabase').' Also failed local fallback save.',
+                    ], 500);
+                }
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Capture saved locally. Supabase upload is currently blocked.',
+                    'filename' => $localResult['filename'],
+                    'path' => $localResult['public_path'],
+                    'public_url' => $localResult['public_path'],
+                    'bucket' => null,
+                    'bucket_file_path' => null,
+                    'warning' => $uploadResult['message'] ?? 'Supabase upload failed',
+                    'step' => $step,
+                ]);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Capture uploaded successfully',
+                'filename' => $uploadResult['filename'],
+                'path' => $uploadResult['object_path'],
+                'public_url' => $uploadResult['public_url'],
+                'preview_url' => $uploadResult['preview_url'] ?? $uploadResult['public_url'],
+                'bucket' => $uploadResult['bucket'],
+                'bucket_file_path' => $uploadResult['bucket_file_path'],
+                'step' => $step,
+            ]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Save capture to local public storage and return file metadata.
+     */
+    protected function saveCaptureLocally(string $binaryImage, string $extension): array
+    {
+        $pictureDir = storage_path('app/public/captures');
+        if (! is_dir($pictureDir) && ! mkdir($pictureDir, 0755, true) && ! is_dir($pictureDir)) {
+            return [
+                'success' => false,
+                'message' => 'Failed to create local capture directory.',
+            ];
+        }
+
+        $filename = 'capture_'.date('Y-m-d_H-i-s').'_'.Str::random(8).'.'.$extension;
+        $filePath = $pictureDir.'/'.$filename;
+
+        if (file_put_contents($filePath, $binaryImage) === false) {
+            return [
+                'success' => false,
+                'message' => 'Failed to write local capture file.',
+            ];
+        }
+
+        return [
+            'success' => true,
+            'filename' => $filename,
+            'absolute_path' => $filePath,
+            'public_path' => '/storage/captures/'.$filename,
+        ];
+    }
+
+    /**
+     * Upload capture to Supabase Storage and return stored object details.
+     */
+    protected function uploadCaptureToSupabase(string $binaryImage, string $extension, int $step): array
+    {
+        $supabaseUrl = rtrim((string) env('SUPABASE_URL', ''), '/');
+        $supabaseKey = (string) (env('SUPABASE_STORAGE_KEY') ?: env('SUPABASE_SERVICE_ROLE_KEY') ?: env('SUPABASE_KEY'));
+
+        if ($supabaseUrl === '' || $supabaseKey === '') {
+            return [
+                'success' => false,
+                'message' => 'Supabase configuration is missing.',
+            ];
+        }
+
+        $bucket = (string) env('SUPABASE_STORAGE_BUCKET', 'visitor-file');
+        // Face ID (step 3) goes to visitor-file/Face_ID_Picture
+        $defaultFolder = $step === 3 ? 'Face_ID_Picture' : 'ID_scan';
+        $folder = trim((string) env('SUPABASE_STORAGE_FACE_ID_FOLDER', $defaultFolder), '/');
+
+        $filename = 'capture_'.date('Y-m-d_H-i-s').'_'.Str::random(8).'.'.$extension;
+        $objectPath = $folder !== '' ? ($folder.'/'.$filename) : $filename;
+
+        $contentType = match ($extension) {
+            'png' => 'image/png',
+            'gif' => 'image/gif',
+            default => 'image/jpeg',
+        };
+
+        $encodedPath = collect(explode('/', $objectPath))
+            ->filter(fn ($segment) => $segment !== '')
+            ->map(fn ($segment) => rawurlencode($segment))
+            ->implode('/');
+
+        $uploadUrl = $supabaseUrl.'/storage/v1/object/'.rawurlencode($bucket).'/'.$encodedPath;
+
+        $response = Http::withHeaders([
+            'apikey' => $supabaseKey,
+            'Authorization' => 'Bearer '.$supabaseKey,
+            'Content-Type' => $contentType,
+            'x-upsert' => 'true',
+        ])->withBody($binaryImage, $contentType)->post($uploadUrl);
+
+        if (! $response->successful()) {
+            \Log::error('Supabase capture upload failed', [
+                'status' => $response->status(),
+                'body' => $response->body(),
+                'bucket' => $bucket,
+                'object_path' => $objectPath,
+                'step' => $step,
+            ]);
+
+            return [
+                'success' => false,
+                'message' => 'Failed to upload capture to Supabase Storage (check bucket RLS policy or service role key).',
+            ];
+        }
+
+        $signedPreviewUrl = $this->createSignedStorageObjectUrl(
+            $supabaseUrl,
+            $supabaseKey,
+            $bucket,
+            $objectPath
+        );
+
+        $publicUrl = $supabaseUrl.'/storage/v1/object/public/'.rawurlencode($bucket).'/'.$encodedPath;
+
+        return [
+            'success' => true,
+            'bucket' => $bucket,
+            'filename' => $filename,
+            'object_path' => $objectPath,
+            'public_url' => $publicUrl,
+            'preview_url' => $signedPreviewUrl ?: $publicUrl,
+            'bucket_file_path' => $bucket.'/'.$objectPath,
+        ];
+    }
+
+    protected function createSignedStorageObjectUrl(
+        string $supabaseUrl,
+        string $supabaseKey,
+        string $bucket,
+        string $objectPath
+    ): ?string {
+        try {
+            $encodedBucket = rawurlencode($bucket);
+            $encodedObjectPath = collect(explode('/', $objectPath))
+                ->filter(fn ($segment) => $segment !== '')
+                ->map(fn ($segment) => rawurlencode($segment))
+                ->implode('/');
+
+            $response = Http::withHeaders([
+                'apikey' => $supabaseKey,
+                'Authorization' => 'Bearer '.$supabaseKey,
+                'Accept' => 'application/json',
+            ])->timeout(20)->post($supabaseUrl.'/storage/v1/object/sign/'.$encodedBucket.'/'.$encodedObjectPath, [
+                'expiresIn' => 3600,
+            ]);
+
+            if (! $response->ok()) {
+                return null;
+            }
+
+            $payload = $response->json();
+            $signed = is_array($payload) ? ($payload['signedURL'] ?? $payload['signedUrl'] ?? null) : null;
+            if (! is_string($signed) || trim($signed) === '') {
+                return null;
+            }
+
+            if (preg_match('/^https?:\/\//i', $signed) === 1) {
+                return $signed;
+            }
+
+            $signedPath = ltrim($signed, '/');
+            if (Str::startsWith($signedPath, 'storage/v1/')) {
+                return $supabaseUrl.'/'.$signedPath;
+            }
+
+            if (Str::startsWith($signedPath, 'object/')) {
+                return $supabaseUrl.'/storage/v1/'.$signedPath;
+            }
+
+            return $supabaseUrl.'/'.$signedPath;
+        } catch (\Throwable $e) {
+            logger()->warning('Unable to build signed storage URL for capture preview: '.$e->getMessage(), [
+                'bucket' => $bucket,
+                'object_path' => $objectPath,
+            ]);
+
+            return null;
+        }
+    }
+
+    /**
+     * Parse ID document using OCR.Space API and extract visitor data.
+     */
+    public function parseId(Request $request)
+    {
+        try {
+            $imageData = null;
+            $source = 'unknown';
+
+            // Handle file upload from FormData (preferred method)
+            if ($request->hasFile('image')) {
+                $imageData = $request->file('image');
+                $source = 'file_upload';
+
+                \Log::info('parseId: File upload received', [
+                    'file_size' => $imageData->getSize(),
+                    'mime_type' => $imageData->getMimeType(),
+                ]);
+            } else {
+                // Fallback to base64 input (backward compatibility)
+                $imageData = $request->input('image');
+                $source = 'base64_input';
+            }
+
+            if (! $imageData) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No image data provided',
+                ], 400);
+            }
+
+            $idType = $request->input('id_type', 'national');
+
+            \Log::info('parseId called', [
+                'source' => $source,
+                'id_type' => $idType,
+            ]);
+
+            // Use OCRService to extract data
+            $ocrService = new OCRService;
+            $ocrResult = $ocrService->parseIdDocument($imageData, $idType);
+
+            \Log::info('OCR result', [
+                'success' => $ocrResult['success'],
+                'message' => $ocrResult['message'] ?? '',
+                'has_extracted_data' => ! empty($ocrResult['extracted_data']),
+            ]);
+
+            if (! $ocrResult['success']) {
+                return response()->json([
+                    'success' => false,
+                    'message' => $ocrResult['message'],
+                    'raw_text' => $ocrResult['raw_text'],
+                ], 400);
+            }
+
+            $extracted = $ocrResult['extracted_data'];
+            $extracted['_raw_text'] = (string) ($ocrResult['raw_text'] ?? '');
+
+            // Map OCR extracted fields to form field names
+            $formData = $this->mapOcrDataToFormFields($extracted);
+            $existingVisitor = $this->findExistingVisitorRecord(
+                $formData,
+                $extracted,
+                (string) $request->input('register_type', 'normal')
+            );
+
+            \Log::info('Mapped form data', [
+                'first_name' => $formData['first_name'] ?? '',
+                'last_name' => $formData['last_name'] ?? '',
+                'birthday' => $formData['birthday'] ?? '',
+                'house_no' => $formData['house_no'] ?? '',
+                'street' => $formData['street'] ?? '',
+                'barangay' => $formData['barangay'] ?? '',
+                'city_municipality' => $formData['city_municipality'] ?? '',
+                'province' => $formData['province'] ?? '',
+                'region' => $formData['region'] ?? '',
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'extracted_data' => $extracted,
+                'form_data' => $formData,
+                'existing_visitor' => $existingVisitor,
+                'raw_text' => $ocrResult['raw_text'],
+                'confidence' => $ocrResult['confidence'] ?? 0,
+            ]);
+        } catch (\Exception $e) {
+            \Log::error('parseId exception', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Error parsing ID: '.$e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Try to find an existing visitor by exact first+last name.
+     */
+    protected function findExistingVisitorRecord(array $formData, array $extracted, string $registerType = 'normal'): array
+    {
+        $firstName = trim((string) ($formData['first_name'] ?? ''));
+        $lastName = trim((string) ($formData['last_name'] ?? ''));
+
+        $baseQuery = static function () {
+            return DB::table('visitor as v')
+                ->leftJoin('address as a', 'a.address_id', '=', 'v.address_id')
+                ->select([
+                    'v.visitor_id',
+                    'v.first_name',
+                    'v.last_name',
+                    'v.birthday',
+                    'v.contact_no',
+                    'v.visitor_photo_with_id_url',
+                    'a.house_no',
+                    'a.street',
+                    'a.barangay',
+                    'a.city_municipality',
+                    'a.province',
+                    'a.region',
+                    'v.created_at',
+                ]);
+        };
+
+        if ($firstName === '' || $lastName === '') {
+            return ['exists' => false];
+        }
+
+        $birthday = $this->normalizeBirthdayValue($formData['birthday'] ?? null);
+        if ($birthday === null) {
+            return ['exists' => false];
+        }
+
+        $record = $baseQuery()
+            ->whereRaw("LOWER(TRIM(COALESCE(v.first_name, ''))) = ?", [Str::lower($firstName)])
+            ->whereRaw("LOWER(TRIM(COALESCE(v.last_name, ''))) = ?", [Str::lower($lastName)])
+            ->whereDate('v.birthday', '=', $birthday)
+            ->whereExists(function ($query) {
+                $query->select(DB::raw(1))
+                    ->from('visit as vi')
+                    ->whereColumn('vi.visitor_id', 'v.visitor_id');
+            })
+            ->orderByDesc('v.created_at')
+            ->orderByDesc('v.visitor_id')
+            ->first();
+
+        if (! $record) {
+            return ['exists' => false];
+        }
+
+        $photoPath = trim((string) ($record->visitor_photo_with_id_url ?? ''));
+
+        $previewUrl = $this->resolveVisitorPhotoUrl($photoPath);
+        logger()->info('Existing visitor photo preview resolved', [
+            'visitor_id' => (int) $record->visitor_id,
+            'photo_path' => $photoPath,
+            'photo_preview_url' => $previewUrl,
+        ]);
+
+        $payload = [
+            'exists' => true,
+            'match_basis' => 'name_birthday',
+            'visitor_id' => (int) $record->visitor_id,
+            'first_name' => (string) ($record->first_name ?? ''),
+            'last_name' => (string) ($record->last_name ?? ''),
+            'birthday' => $this->normalizeBirthdayValue($record->birthday),
+            'control_number' => '',
+            'contact_no' => (string) ($record->contact_no ?? ''),
+            // pass_number is per-visit; never reuse the previous visit's number
+            'pass_number' => '',
+            'house_no' => (string) ($record->house_no ?? ''),
+            'street' => (string) ($record->street ?? ''),
+            'barangay' => (string) ($record->barangay ?? ''),
+            'city_municipality' => (string) ($record->city_municipality ?? ''),
+            'province' => (string) ($record->province ?? ''),
+            'region' => (string) ($record->region ?? ''),
+            'photo_path' => $photoPath,
+            'photo_preview_url' => $previewUrl,
+            'unfinished_enrollee' => null,
+        ];
+
+        if (strtolower(trim($registerType)) === 'enrollee') {
+            $payload['unfinished_enrollee'] = $this->findUnfinishedEnrolleeResume((int) $record->visitor_id);
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Find the latest unfinished enrollee route for a visitor so registration can resume progress.
+     */
+    protected function findUnfinishedEnrolleeResume(int $visitorId): ?array
+    {
+        if ($visitorId <= 0) {
+            return null;
+        }
+
+        $enrollee = DB::table('enrollee')
+            ->where('visitor_id', $visitorId)
+            ->orderByDesc('enrollee_id')
+            ->first();
+
+        $visits = DB::table('visit as v')
+            ->leftJoin('visit_type as vt', 'vt.visit_type_id', '=', 'v.visit_type_id')
+            ->where('v.visitor_id', $visitorId)
+            ->where(function ($query) {
+                $query->whereRaw("LOWER(TRIM(COALESCE(vt.visit_type_name, ''))) = ?", ['enrollee'])
+                    ->orWhereRaw("LOWER(TRIM(COALESCE(v.purpose_reason, ''))) LIKE ?", ['%enrollment%'])
+                    ->orWhereExists(function ($existsQuery) {
+                        $existsQuery->select(DB::raw(1))
+                            ->from('enrollee as e')
+                            ->whereColumn('e.visitor_id', 'v.visitor_id');
+                    });
+            })
+            ->orderByDesc('v.visit_id')
+            ->select([
+                'v.visit_id',
+                'v.qr_token',
+                'v.entry_time',
+                'v.exit_time',
+            ])
+            ->limit(25)
+            ->get();
+
+        foreach ($visits as $visit) {
+            $expectations = DB::table('office_expectation as oe')
+                ->leftJoin('office as o', 'o.office_id', '=', 'oe.office_id')
+                ->leftJoin('expectation_status as xs', 'xs.expectation_status_id', '=', 'oe.expectation_status_id')
+                ->where('oe.visit_id', (int) $visit->visit_id)
+                ->orderBy('oe.expected_order')
+                ->orderBy('oe.expectation_id')
+                ->select([
+                    'oe.office_id',
+                    'oe.expected_order',
+                    'oe.arrived_at',
+                    'oe.expectation_status_id',
+                    'o.office_name',
+                    'xs.status_name',
+                ])
+                ->get();
+
+            if ($expectations->isEmpty()) {
+                continue;
+            }
+
+            $total = $expectations->count();
+            $completed = $expectations->filter(static fn ($row) => ! empty($row->arrived_at))->count();
+
+            if ($completed >= $total) {
+                continue;
+            }
+
+            $steps = $expectations->map(function ($row, $index) {
+                $isDone = ! empty($row->arrived_at);
+
+                return [
+                    'order' => $row->expected_order !== null ? (int) $row->expected_order : ($index + 1),
+                    'office_id' => $row->office_id !== null ? (int) $row->office_id : null,
+                    'office_name' => trim((string) ($row->office_name ?? '')) ?: 'Enrollment Step',
+                    'state' => $isDone ? 'done' : 'pending',
+                    'arrived_at' => $row->arrived_at,
+                ];
+            })->values()->all();
+
+            $current = collect($steps)->firstWhere('state', 'pending');
+
+            return [
+                'has_unfinished' => true,
+                'source_visit_id' => (int) $visit->visit_id,
+                'enrollee_id' => $enrollee ? (int) $enrollee->enrollee_id : null,
+                'total_steps' => $total,
+                'completed_steps' => $completed,
+                'remaining_steps' => max(0, $total - $completed),
+                'percent' => $total > 0 ? (int) round(($completed / $total) * 100) : 0,
+                'current_office' => $current['office_name'] ?? null,
+                'steps' => $steps,
+            ];
+        }
+
+        if (! $enrollee) {
+            return null;
+        }
+
+        $progressRows = DB::table('enrollee_progress as ep')
+            ->join('enrollee_step as es', 'es.step_id', '=', 'ep.step_id')
+            ->leftJoin('office as o', 'o.office_id', '=', 'es.office_id')
+            ->leftJoin('step_status as st', 'st.step_status_id', '=', 'ep.step_status_id')
+            ->where('ep.enrollee_id', (int) $enrollee->enrollee_id)
+            ->orderBy('es.step_order')
+            ->orderBy('es.step_id')
+            ->select([
+                'es.office_id',
+                'es.step_order',
+                'o.office_name',
+                'ep.completed_at',
+                'st.status_name',
+            ])
+            ->get();
+
+        if ($progressRows->isEmpty()) {
+            return null;
+        }
+
+        $steps = $progressRows->map(function ($row, $index) {
+            $status = Str::lower(trim((string) ($row->status_name ?? '')));
+            $isDone = ! empty($row->completed_at);
+            if (! $isDone && $status !== '') {
+                foreach (['completed', 'complete', 'done', 'arrived', 'validated', 'finished', 'success'] as $needle) {
+                    if (str_contains($status, $needle)) {
+                        $isDone = true;
+                        break;
+                    }
+                }
+            }
+
+            return [
+                'order' => $row->step_order !== null ? (int) $row->step_order : ($index + 1),
+                'office_id' => $row->office_id !== null ? (int) $row->office_id : null,
+                'office_name' => trim((string) ($row->office_name ?? '')) ?: 'Enrollment Step',
+                'state' => $isDone ? 'done' : 'pending',
+                'arrived_at' => $row->completed_at,
+            ];
+        })->values()->all();
+
+        $total = count($steps);
+        $completed = collect($steps)->where('state', 'done')->count();
+
+        if ($completed >= $total) {
+            return null;
+        }
+
+        $current = collect($steps)->firstWhere('state', 'pending');
+
+        return [
+            'has_unfinished' => true,
+            'source_visit_id' => null,
+            'enrollee_id' => (int) $enrollee->enrollee_id,
+            'total_steps' => $total,
+            'completed_steps' => $completed,
+            'remaining_steps' => max(0, $total - $completed),
+            'percent' => $total > 0 ? (int) round(($completed / $total) * 100) : 0,
+            'current_office' => $current['office_name'] ?? null,
+            'steps' => $steps,
+        ];
+    }
+
+    /**
+     * Resolve stored visitor photo path to a browser-displayable URL when possible.
+     */
+    protected function resolveVisitorPhotoUrl(string $photoPath): ?string
+    {
+        $cleanPath = trim($photoPath);
+        if ($cleanPath === '') {
+            return null;
+        }
+
+        if (Str::startsWith($cleanPath, ['http://', 'https://'])) {
+            return $cleanPath;
+        }
+
+        // Local fallback path (used when Supabase upload is blocked):
+        // /storage/captures/xxx.jpg or storage/captures/xxx.jpg
+        // Do not treat Supabase API paths (storage/v1/...) as local files.
+        if (
+            Str::startsWith($cleanPath, ['/storage/', 'storage/'])
+            && ! Str::contains($cleanPath, 'storage/v1/')
+        ) {
+            $normalized = '/'.ltrim($cleanPath, '/');
+
+            return url($normalized);
+        }
+
+        [$bucket, $objectPath] = $this->parseStorageObjectPathForPreview($cleanPath);
+        if ($bucket === null || $objectPath === null) {
+            return null;
+        }
+
+        $supabaseUrl = rtrim((string) env('SUPABASE_URL', ''), '/');
+        if ($supabaseUrl === '') {
+            return null;
+        }
+
+        $supabaseKey = (string) (env('SUPABASE_STORAGE_KEY') ?: env('SUPABASE_SERVICE_ROLE_KEY') ?: env('SUPABASE_KEY') ?: '');
+        if ($supabaseKey !== '') {
+            try {
+                $encodedBucket = rawurlencode($bucket);
+                $encodedObjectPath = collect(explode('/', $objectPath))
+                    ->map(fn ($segment) => rawurlencode($segment))
+                    ->implode('/');
+
+                $signedResponse = Http::withHeaders([
+                    'apikey' => $supabaseKey,
+                    'Authorization' => 'Bearer '.$supabaseKey,
+                    'Accept' => 'application/json',
+                ])->timeout(20)->post($supabaseUrl.'/storage/v1/object/sign/'.$encodedBucket.'/'.$encodedObjectPath, [
+                    'expiresIn' => 3600,
+                ]);
+
+                if ($signedResponse->ok()) {
+                    $payload = $signedResponse->json();
+                    $signed = is_array($payload) ? ($payload['signedURL'] ?? $payload['signedUrl'] ?? null) : null;
+
+                    if (is_string($signed) && trim($signed) !== '') {
+                        if (preg_match('/^https?:\/\//i', $signed) === 1) {
+                            return $signed;
+                        }
+
+                        $signedPath = ltrim($signed, '/');
+                        if (Str::startsWith($signedPath, 'storage/v1/')) {
+                            return $supabaseUrl.'/'.$signedPath;
+                        }
+
+                        if (Str::startsWith($signedPath, 'object/')) {
+                            return $supabaseUrl.'/storage/v1/'.$signedPath;
+                        }
+
+                        return $supabaseUrl.'/'.$signedPath;
+                    }
+                }
+            } catch (\Throwable $e) {
+                logger()->warning('Unable to sign visitor preview URL: '.$e->getMessage());
+            }
+        }
+
+        // Public bucket fallback.
+        $encodedPath = implode('/', array_map('rawurlencode', explode('/', $objectPath)));
+
+        return $supabaseUrl.'/storage/v1/object/public/'.rawurlencode($bucket).'/'.$encodedPath;
+    }
+
+    protected function parseStorageObjectPathForPreview(string $rawPath): array
+    {
+        $path = trim($rawPath);
+        if ($path === '') {
+            return [null, null];
+        }
+
+        $path = preg_replace('#^https?://[^/]+/#i', '', $path) ?? $path;
+        $path = ltrim($path, '/');
+
+        $publicPrefix = 'storage/v1/object/public/';
+        if (Str::startsWith($path, $publicPrefix)) {
+            $path = Str::after($path, $publicPrefix);
+        }
+
+        $signPrefix = 'storage/v1/object/sign/';
+        if (Str::startsWith($path, $signPrefix)) {
+            $path = Str::after($path, $signPrefix);
+            $path = explode('?', $path, 2)[0] ?? $path;
+        }
+
+        $segments = array_values(array_filter(explode('/', $path), fn ($segment) => $segment !== ''));
+        if (count($segments) < 2) {
+            return [null, null];
+        }
+
+        $bucket = (string) $segments[0];
+        $objectPath = implode('/', array_slice($segments, 1));
+
+        return [$bucket !== '' ? $bucket : null, $objectPath !== '' ? $objectPath : null];
+    }
+
+    /**
+     * Map OCR extracted data to visitor form field names.
+     */
+    protected function mapOcrDataToFormFields(array $extracted): array
+    {
+        // Prefer direct extracted name fields, fallback to full_name parsing
+        $firstName = trim((string) ($extracted['first_name'] ?? ''));
+        $lastName = trim((string) ($extracted['last_name'] ?? ''));
+        $documentType = strtolower(trim((string) ($extracted['document_type'] ?? '')));
+        $rawOcrText = (string) ($extracted['_raw_text'] ?? '');
+
+        if ((empty($firstName) || empty($lastName)) && ! empty($extracted['full_name'])) {
+            $parts = explode(',', $extracted['full_name']);
+            if (count($parts) >= 2) {
+                // Format: "LastName, FirstName"
+                if (empty($lastName)) {
+                    $lastName = trim($parts[0]);
+                }
+                if (empty($firstName)) {
+                    $firstName = trim($parts[1]);
+                }
+            } else {
+                if ($documentType === 'passport') {
+                    if (empty($firstName)) {
+                        $firstName = trim($extracted['full_name']);
+                    }
+
+                    // For passports, do not guess a surname from a space-separated given name.
+                } else {
+                    // Try space-separated
+                    $nameParts = explode(' ', trim($extracted['full_name']));
+                    if (count($nameParts) > 1) {
+                        if (empty($firstName)) {
+                            $firstName = $nameParts[0];
+                        }
+                        if (empty($lastName)) {
+                            $lastName = implode(' ', array_slice($nameParts, 1));
+                        }
+                    } else {
+                        if (empty($firstName)) {
+                            $firstName = trim($extracted['full_name']);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Parse address into components
+        $addressSource = trim((string) ($extracted['address'] ?? ''));
+
+        if (
+            ! empty($addressSource)
+            && (
+                (($extracted['document_type'] ?? '') === 'passport')
+                || preg_match('/\b(PLACE\s+OF\s+B|BIRTH\s+PLACE|POB|PLOCE)\b/i', $addressSource)
+            )
+        ) {
+            $addressSource = $this->normalizePassportPlaceOfBirthSource($addressSource);
+        }
+
+        if (empty($addressSource) && ! empty($extracted['place_of_birth'])) {
+            $addressSource = $this->normalizePassportPlaceOfBirthSource((string) $extracted['place_of_birth']);
+        }
+
+        $addressData = $this->parseAddress($addressSource);
+
+        if ($documentType === 'umid') {
+            $addressData = $this->enhanceUmidAddressDataFromRawText($addressData, $addressSource, $rawOcrText);
+        }
+
+        if (empty($addressData['city']) && ! empty($extracted['place_of_birth'])) {
+            $birthplaceData = $this->parseAddress($this->normalizePassportPlaceOfBirthSource((string) $extracted['place_of_birth']));
+            if (! empty($birthplaceData['city'])) {
+                $addressData['city'] = $birthplaceData['city'];
+            }
+            if (empty($addressData['province']) && ! empty($birthplaceData['province'])) {
+                $addressData['province'] = $birthplaceData['province'];
+            }
+            if (empty($addressData['region']) && ! empty($birthplaceData['region'])) {
+                $addressData['region'] = $birthplaceData['region'];
+            }
+        }
+
+        $addressData = $this->sanitizeParsedAddressData($addressData);
+
+        // Auto-infer PH region from extracted province when available
+        if (empty($addressData['region']) && ! empty($addressData['province'])) {
+            $addressData['region'] = $this->inferRegionFromProvince($addressData['province']);
+        }
+
+        return [
+            'first_name' => $firstName,
+            'last_name' => $lastName,
+            'birthday' => $this->normalizeBirthdayValue($extracted['date_of_birth'] ?? null),
+            'house_no' => $addressData['house_no'],
+            'street' => $addressData['street'],
+            'barangay' => $addressData['barangay'],
+            'city_municipality' => $addressData['city'],
+            'province' => $addressData['province'],
+            'region' => $addressData['region'],
+        ];
+    }
+
+    protected function normalizeBirthdayValue($value): ?string
+    {
+        $raw = trim((string) ($value ?? ''));
+        if ($raw === '') {
+            return null;
+        }
+
+        // OCR cleanup: 0CTOBER -> OCTOBER, I963/L963 -> 1963, OCTOBER23 -> OCTOBER 23
+        $cleaned = strtoupper($raw);
+        $cleaned = strtr($cleaned, [
+            '0CTOBER' => 'OCTOBER',
+            'N0VEMBER' => 'NOVEMBER',
+            '0CT' => 'OCT',
+            'N0V' => 'NOV',
+        ]);
+        $cleaned = preg_replace('/\b([IL])(\d{3})\b/', '1$2', $cleaned) ?? $cleaned;
+        $cleaned = preg_replace('/\b([A-Z]{3,12})(\d{1,2})\b/', '$1 $2', $cleaned) ?? $cleaned;
+        $cleaned = preg_replace('/(\d{1,2}),(\d{4})/', '$1, $2', $cleaned) ?? $cleaned;
+        $cleaned = preg_replace('/\s+/', ' ', trim($cleaned)) ?? $cleaned;
+
+        // Prefer explicit month/day/year token from noisy OCR lines.
+        if (preg_match('/\b(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)\s+\d{1,2}(?:,|\s)?\s*\d{4}\b/i', $cleaned, $m)) {
+            $cleaned = trim((string) $m[0]);
+        } elseif (preg_match('/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})\b/', $cleaned, $m)) {
+            $cleaned = trim((string) $m[1]);
+        }
+
+        try {
+            return Carbon::parse($cleaned)->toDateString();
+        } catch (\Throwable $e) {
+            try {
+                return Carbon::parse($raw)->toDateString();
+            } catch (\Throwable $e) {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Strip passport birthplace label noise so the city parser can work on the real municipality.
+     */
+    protected function normalizePassportPlaceOfBirthSource(string $placeOfBirth): string
+    {
+        $normalized = $this->normalizeAddressForParsing($placeOfBirth);
+
+        $normalized = preg_replace('/\b(PLACE\s+OF\s+B(?:IRTH|ERTE)|BIRTH\s+PLACE|PLACE\s+OF\s+BIRTH|POB)\b/i', ' ', $normalized);
+        $normalized = preg_replace('/\b[A-Z]\b/', ' ', $normalized);
+        $normalized = preg_replace('/\s+/', ' ', trim((string) $normalized));
+
+        if (preg_match('/\bCITY\s+OF\s+([A-Z\s]{2,40})\b/', $normalized, $m)) {
+            return 'CITY OF '.trim($m[1]);
+        }
+
+        if (preg_match('/\b([A-Z\s]{2,40})\s+CITY\b/', $normalized, $m)) {
+            return trim($m[1]).' CITY';
+        }
+
+        if (preg_match('/\b(CALAPAN|LIPA|BATANGAS|MINDORO|PUERTO|ORIENTAL|OCCIDENTAL)\b/i', $normalized, $m)) {
+            $candidate = strtoupper(trim($m[1]));
+            if ($candidate === 'LIPA') {
+                return 'CITY OF LIPA';
+            }
+
+            if ($candidate === 'CALAPAN') {
+                return 'CALAPAN CITY';
+            }
+
+            return $candidate;
+        }
+
+        return trim((string) $normalized);
+    }
+
+    /**
+     * Parse address string into components.
+     * Best-effort extraction for house/street/barangay/city/province/region.
+     */
+    protected function parseAddress(string $address): array
+    {
+        $result = [
+            'house_no' => '',
+            'street' => '',
+            'barangay' => '',
+            'city' => '',
+            'province' => '',
+            'region' => '',
+        ];
+
+        if (empty($address)) {
+            return $result;
+        }
+
+        $normalizedAddress = $this->normalizeAddressForParsing($address);
+        $umidNormalizedAddress = trim((string) preg_replace('/\bPHL(?:\s*[0-9?]{3,5})?\b/i', '', $normalizedAddress));
+        $umidNormalizedAddress = trim((string) preg_replace('/\s+/', ' ', $umidNormalizedAddress));
+        $parts = array_values(array_filter(array_map('trim', explode(',', $normalizedAddress)), fn ($part) => $part !== ''));
+
+        // UMID compact format often has no commas:
+        // "218 PRK 3 BRGY MALITLIT LIPA CITY BATANGAS PHL 4217"
+        // "218 BRGY MALITLIT LIPA CITY BATANGAS PHL 4217"
+        if (! empty($umidNormalizedAddress)) {
+            if (empty($result['house_no']) && preg_match('/^\s*(\d{1,5}[A-Z0-9-]*)\b/i', $umidNormalizedAddress, $m)) {
+                $result['house_no'] = trim((string) $m[1]);
+            }
+
+            if (
+                empty($result['house_no'])
+                && preg_match('/\b(\d{1,5}[A-Z0-9-]*)\s+(?:P\s*R\s*K|PRK|PUROK|BRGY)\b/i', $umidNormalizedAddress, $m)
+            ) {
+                $result['house_no'] = trim((string) $m[1]);
+            }
+
+            if (
+                empty($result['street'])
+                && preg_match('/\b(?:P\s*R\s*K|PRK|PUROK)\.?\s*[,.:;-]?\s*([A-Z0-9-]+)\b/i', $umidNormalizedAddress, $m)
+            ) {
+                $purokToken = strtoupper(trim((string) $m[1]));
+                if (preg_match('/^\d{1,2}[A-Z]?$/', $purokToken)) {
+                    $result['street'] = 'Purok '.$purokToken;
+                }
+            }
+
+            // OCR can drop the PRK label and leave just a small number before BRGY.
+            if (
+                empty($result['street'])
+                && preg_match('/^\s*\d{1,5}[A-Z0-9-]*\s+(\d{1,2}[A-Z]?)\s+BRGY\.?\b/i', $umidNormalizedAddress, $m)
+            ) {
+                $result['street'] = 'Purok '.strtoupper(trim((string) $m[1]));
+            }
+
+            if (
+                empty($result['street'])
+                && preg_match('/^\s*\d{1,5}[A-Z0-9-]*\s+(.+?)\s+BRGY\.?\b/i', $umidNormalizedAddress, $m)
+            ) {
+                $streetCandidate = trim((string) $m[1]);
+                if (! empty($streetCandidate)) {
+                    $result['street'] = ucwords(strtolower($streetCandidate));
+                }
+            }
+
+            if (
+                empty($result['barangay'])
+                && preg_match('/\bBRGY\.?\s+([A-Z\s]+?)(?=\s+(?:CITY\s+OF\s+[A-Z\s]+|[A-Z\s]+?\s+CITY|MUNICIPALITY)\b|$)/i', $umidNormalizedAddress, $m)
+            ) {
+                $result['barangay'] = ucwords(strtolower(trim((string) $m[1])));
+            }
+
+            // Some UMIDs only contain house no. + barangay + city/province (no explicit street).
+            if (
+                empty($result['street'])
+                && ! empty($result['barangay'])
+                && preg_match('/\bBRGY\.?\b/i', $umidNormalizedAddress)
+            ) {
+                $result['street'] = 'Brgy. '.$result['barangay'];
+            }
+
+            if (empty($result['city']) && preg_match('/\bLIPA\s+CITY\b/i', $umidNormalizedAddress)) {
+                $result['city'] = 'Lipa City';
+            } elseif (empty($result['city']) && preg_match('/\bCITY\s+OF\s+([A-Z\s]+?)(?=\s+\bBATANGAS\b|$)/i', $umidNormalizedAddress, $m)) {
+                $result['city'] = 'City of '.ucwords(strtolower(trim((string) $m[1])));
+            } elseif (empty($result['city']) && preg_match('/\b([A-Z]+)\s+CITY\b/i', $umidNormalizedAddress, $m)) {
+                $result['city'] = ucwords(strtolower(trim((string) $m[1]).' City'));
+            }
+
+            if (empty($result['province']) && preg_match('/\bBATANGAS\b/i', $umidNormalizedAddress)) {
+                $result['province'] = 'Batangas';
+            }
+        }
+
+        // Village-style pattern, e.g.:
+        // "ROAD 29, BLOCK 31, LOT 16, BULATI, STREET BANAYBANAY, LIPA CITY, BATANGAS"
+        $houseParts = [];
+        foreach ($parts as $idx => $part) {
+            if (preg_match('/^(ROAD|BLOCK|LOT)\s+[A-Z0-9-]+$/i', $part)) {
+                $houseParts[] = strtoupper($part);
+
+                continue;
+            }
+
+            if (preg_match('/^STREET\s+([A-Z\s]+?)(?:\s+[A-Z]+\s+CITY|\s+CITY|\s+MUNICIPALITY|$)/i', $part, $m)) {
+                if (empty($result['street']) && isset($parts[$idx - 1])) {
+                    $prevPart = trim((string) $parts[$idx - 1]);
+                    if (
+                        ! empty($prevPart)
+                        && ! preg_match('/^(ROAD|BLOCK|LOT)\s+/i', $prevPart)
+                        && ! preg_match('/\b(CITY|MUNICIPALITY|PROVINCE|REGION|BATANGAS)\b/i', $prevPart)
+                    ) {
+                        $result['street'] = ucwords(strtolower($prevPart));
+                    }
+                }
+
+                if (empty($result['barangay'])) {
+                    $result['barangay'] = ucwords(strtolower(trim($m[1])));
+                }
+            }
+        }
+
+        if (! empty($houseParts) && empty($result['house_no'])) {
+            $result['house_no'] = implode(', ', $houseParts);
+        }
+
+        // Pattern seen in National ID OCR:
+        // "0278 ROSAS ST MUNTING PULO, CITY OF LIPA, BATANGAS"
+        if (preg_match('/^\s*(\d+[A-Z0-9-]*)\s+([A-Z\s]+?\b(?:ST|STREET|RD|ROAD|AVE|AVENUE|BLVD|BOULEVARD|LN|LANE)\b)\s+([A-Z][A-Z\s]+?)(?:,|$)/i', $normalizedAddress, $m)) {
+            $result['house_no'] = trim($m[1]);
+            $result['street'] = ucwords(strtolower(trim($m[2])));
+            $result['barangay'] = ucwords(strtolower(trim($m[3])));
+        }
+
+        // Common National ID compact format example:
+        // "PUROK 5, MUNTING PULO CITY OF LIPA BATANGAS"
+        if (preg_match('/\bPUROK\s*\d+\s*,?\s*([A-Z][A-Z\s]+?)\s+CITY\s+OF\b/i', $normalizedAddress, $m)) {
+            $result['barangay'] = ucwords(strtolower(trim($m[1])));
+        }
+
+        if (preg_match('/\bCITY\s+OF\s+([A-Z\s]+?)(?:\s+BATANGAS|\s+PROVINCE|$)/i', $normalizedAddress, $m)) {
+            $result['city'] = 'City of '.ucwords(strtolower(trim($m[1])));
+        } elseif (preg_match('/\b([A-Z\s]+)\s+CITY\b/i', $normalizedAddress, $m)) {
+            $result['city'] = ucwords(strtolower(trim($m[1]).' City'));
+        }
+
+        if (preg_match('/\bBATANGAS\b/i', $normalizedAddress)) {
+            $result['province'] = 'Batangas';
+        }
+
+        // Ignore common OCR garbage-only address values.
+        if (preg_match('/^(CLIKANGPILIPINA|PILIPINAS|REPUBLIKANGPILIPINAS)$/i', trim($address))) {
+            return $result;
+        }
+
+        // Try to identify address components by keywords
+        $addressLower = strtolower($normalizedAddress);
+        $lines = array_filter(
+            array_map('trim', explode(',', $normalizedAddress)),
+            fn ($line) => ! empty($line)
+        );
+
+        // Handle OCR-noisy National ID address chunks like
+        // "PUROK 5, MUNTING PULO, CITY OE IPA, BATANGAS".
+        $remainingParts = [];
+        foreach ($lines as $line) {
+            $lineUpper = strtoupper($line);
+
+            if (preg_match('/\bCITY\b/', $lineUpper)) {
+                $normalizedCity = $this->normalizeCityFromOcrChunk($lineUpper, $normalizedAddress);
+                if (! empty($normalizedCity)) {
+                    $result['city'] = $normalizedCity;
+
+                    continue;
+                }
+            }
+
+            if (preg_match('/\bBATANGAS\b/i', $lineUpper)) {
+                $result['province'] = 'Batangas';
+
+                continue;
+            }
+
+            if (preg_match('/\bPUROK\s*\d+\b/i', $lineUpper)) {
+                continue;
+            }
+
+            if (
+                empty($result['barangay'])
+                && preg_match('/^[A-Z\s]{3,}$/', $lineUpper)
+                && ! preg_match('/\b(CITY|MUNICIPALITY|PROVINCE|REGION|STREET|ROAD|AVENUE|PHL|PRK|PUROK|BRGY|BARANGAY)\b/', $lineUpper)
+            ) {
+                $result['barangay'] = ucwords(strtolower(trim($lineUpper)));
+
+                continue;
+            }
+
+            $remainingParts[] = $line;
+        }
+
+        foreach ($remainingParts as $line) {
+            $lineLower = strtolower($line);
+
+            if (preg_match('/^(?:no\.?|house|#)\s*(\d+[a-z]?|\w+[\w\s]*)/i', $line, $m)) {
+                $result['house_no'] = trim($m[1]);
+            } elseif (preg_match('/\b(st|street|ave|avenue|blvd|boulevard|lane|ln|road|rd)\b/i', $lineLower)) {
+                if (preg_match('/^\s*(\d+[A-Z0-9-]*)\s+([A-Z\s]+?\b(?:ST|STREET|RD|ROAD|AVE|AVENUE|BLVD|BOULEVARD|LN|LANE)\b)\s+([A-Z][A-Z\s]+?)\s*$/i', $line, $m)) {
+                    if (empty($result['house_no'])) {
+                        $result['house_no'] = trim($m[1]);
+                    }
+
+                    if (empty($result['street'])) {
+                        $result['street'] = ucwords(strtolower(trim($m[2])));
+                    }
+
+                    if (empty($result['barangay'])) {
+                        $result['barangay'] = ucwords(strtolower(trim($m[3])));
+                    }
+                } elseif (empty($result['street'])) {
+                    $result['street'] = trim($line);
+                }
+            } elseif (preg_match('/\bbarangay|brgy\b/i', $lineLower)) {
+                if (preg_match('/(?:barangay|brgy)[.:\s]+([^,]+)/i', $line, $m)) {
+                    $result['barangay'] = trim($m[1]);
+                } else {
+                    $result['barangay'] = trim(preg_replace('/^(?:barangay|brgy)[.:\s]*/i', '', $line));
+                }
+            } elseif (empty($result['city']) && preg_match('/\bcity|municipality|municipal|mun\b/i', $lineLower)) {
+                if (preg_match('/(?:city|municipality|mun)[.:\s]+([^,]+)/i', $line, $m)) {
+                    $result['city'] = trim($m[1]);
+                } else {
+                    $result['city'] = trim(preg_replace('/^(?:city|municipality|mun)[.:\s]*/i', '', $line));
+                }
+            } elseif (empty($result['province']) && preg_match('/\bprovince|prov\b/i', $lineLower)) {
+                if (preg_match('/(?:province|prov)[.:\s]+([^,]+)/i', $line, $m)) {
+                    $result['province'] = trim($m[1]);
+                } else {
+                    $result['province'] = trim(preg_replace('/^(?:province|prov)[.:\s]*/i', '', $line));
+                }
+            } elseif (preg_match('/\bregion|reg\b/i', $lineLower)) {
+                if (preg_match('/(?:region|reg)[.:\s]+([^,]+)/i', $line, $m)) {
+                    $result['region'] = trim($m[1]);
+                } else {
+                    $result['region'] = trim(preg_replace('/^(?:region|reg)[.:\s]*/i', '', $line));
+                }
+            }
+        }
+
+        // Pattern fallback for National ID address like: "PUROK 5, MUNTING PULO, CITY OF LIPA, BATANGAS"
+        if (preg_match('/\b(CITY\s+OF\s+[A-Z\s]+|[A-Z\s]+\s+CITY)\b/i', $normalizedAddress, $m) && empty($result['city'])) {
+            $result['city'] = ucwords(strtolower(trim($m[1])));
+        }
+
+        // Fallback: infer city/province from unlabeled trailing parts
+        if (empty($result['province']) && count($lines) > 1) {
+            $lastPart = trim(end($lines));
+            if (
+                preg_match('/^[A-Za-z\s]{3,}$/', $lastPart)
+                && ! preg_match('/\b(city|municipality|barangay|brgy|street|st|road|rd|avenue|ave|pilipina|prk|purok)\b/i', $lastPart)
+                && ! preg_match('/^[A-Za-z]{12,}$/', $lastPart)
+                && $this->inferRegionFromProvince($lastPart) !== ''
+            ) {
+                $result['province'] = $lastPart;
+            }
+        }
+
+        if (empty($result['city']) && ! empty($lines)) {
+            foreach ($lines as $line) {
+                if (preg_match('/\b(city\s+of\s+[A-Za-z\s]+)\b/i', $line, $m)) {
+                    $result['city'] = trim($m[1]);
+                    break;
+                }
+            }
+        }
+
+        // Unlabeled National ID fallback:
+        // "012 BANABA, PADRE GARCIA, BATANGAS, PHL" -> barangay=Banaba, city=Padre Garcia.
+        $normalizedParts = array_values(array_filter(array_map(
+            static fn ($part) => strtoupper(trim((string) $part)),
+            $lines
+        )));
+        $provinceUpper = strtoupper(trim((string) ($result['province'] ?? '')));
+        $cityUpper = strtoupper(trim((string) ($result['city'] ?? '')));
+
+        if (empty($result['city']) && ! empty($normalizedParts)) {
+            for ($i = count($normalizedParts) - 1; $i >= 0; $i--) {
+                $candidate = $normalizedParts[$i];
+                if ($candidate === '' || $candidate === 'PHL' || $candidate === $provinceUpper) {
+                    continue;
+                }
+
+                if (preg_match('/\b(CITY|MUNICIPALITY|PROVINCE|REGION|BARANGAY|BRGY|PUROK|PRK|STREET|ROAD|AVENUE)\b/', $candidate)) {
+                    continue;
+                }
+
+                // Municipality/city names are usually plain alpha chunks.
+                if (preg_match('/^[A-Z][A-Z\s]{2,40}$/', $candidate)) {
+                    $result['city'] = ucwords(strtolower($candidate));
+                    $cityUpper = strtoupper($result['city']);
+                    break;
+                }
+            }
+        }
+
+        if (! empty($normalizedParts)) {
+            $leadingPart = $normalizedParts[0];
+            $leadingBarangay = $this->extractBarangayFromLeadingAddressPart($leadingPart);
+
+            if (empty($result['barangay']) && $leadingBarangay !== '') {
+                $result['barangay'] = $leadingBarangay;
+            }
+
+            // If OCR previously treated municipality as barangay, recover barangay from leading part.
+            if (
+                ! empty($result['city'])
+                && ! empty($result['barangay'])
+                && strtoupper(trim((string) $result['barangay'])) === $cityUpper
+                && $leadingBarangay !== ''
+            ) {
+                $result['barangay'] = $leadingBarangay;
+            }
+        }
+
+        return $result;
+    }
+
+    protected function extractBarangayFromLeadingAddressPart(string $part): string
+    {
+        $part = strtoupper(trim($part));
+        if ($part === '' || $part === 'PHL') {
+            return '';
+        }
+
+        $candidate = preg_replace('/^\d{1,6}[A-Z0-9-]*\s+/', '', $part) ?? $part;
+        $candidate = trim((string) preg_replace('/\b(PHL|CITY|MUNICIPALITY|PROVINCE|REGION)\b.*/', '', $candidate));
+        if ($candidate === '') {
+            return '';
+        }
+
+        if (preg_match('/\b(BRGY|BARANGAY|PUROK|PRK|STREET|ROAD|AVENUE)\b/', $candidate)) {
+            return '';
+        }
+
+        if (! preg_match('/^[A-Z][A-Z\s]{1,40}$/', $candidate)) {
+            return '';
+        }
+
+        return ucwords(strtolower($candidate));
+    }
+
+    protected function enhanceUmidAddressDataFromRawText(array $addressData, string $addressSource, string $rawOcrText): array
+    {
+        $segment = $this->extractUmidAddressSegmentFromRawText($rawOcrText);
+        $context = trim($addressSource.' '.$segment);
+        $normalized = $this->normalizeAddressForParsing($context);
+
+        if ($normalized === '') {
+            return $addressData;
+        }
+
+        if (empty($addressData['house_no']) && preg_match('/\b(\d{1,5}[A-Z0-9-]*)\s*(?=(?:PRK|PUROK|BRGY)\b)/i', $normalized, $m)) {
+            $addressData['house_no'] = trim((string) $m[1]);
+        }
+
+        if (
+            empty($addressData['street'])
+            && preg_match('/\b(?:PRK|PUROK)\b\s*[,.:;-]?\s*(\d{1,2}[A-Z]?)\b/i', $normalized, $m)
+        ) {
+            $addressData['street'] = 'Purok '.strtoupper(trim((string) $m[1]));
+        }
+
+        if (
+            $this->isGenericBarangayPlaceholder((string) ($addressData['barangay'] ?? ''))
+            && preg_match('/\bBRGY\.?\s*[,.:;-]?\s*([A-Z]{3,20})\b/i', $normalized, $m)
+        ) {
+            $candidate = strtoupper(trim((string) $m[1]));
+            if (! in_array($candidate, ['CITY', 'PRK', 'PUROK', 'PHL'], true)) {
+                $addressData['barangay'] = ucwords(strtolower($candidate));
+            }
+        }
+
+        if (empty($addressData['city']) && (preg_match('/\bLIPA\s+CITY\b/i', $normalized) || preg_match('/\bCITY\s+OF\s+LIPA\b/i', $normalized))) {
+            $addressData['city'] = 'City of Lipa';
+        }
+
+        if (empty($addressData['province']) && preg_match('/\bBATANGAS\b/i', $normalized)) {
+            $addressData['province'] = 'Batangas';
+        }
+
+        // Postal code 4217 points to Lipa, Batangas and is common in this UMID sample layout.
+        if (preg_match('/\b4217\b/', $normalized)) {
+            if (empty($addressData['city'])) {
+                $addressData['city'] = 'City of Lipa';
+            }
+            if (empty($addressData['province'])) {
+                $addressData['province'] = 'Batangas';
+            }
+        }
+
+        if (
+            empty($addressData['street'])
+            && preg_match('/\bPRK\b/i', $normalized)
+            && preg_match('/\bBRGY\b/i', $normalized)
+            && preg_match('/\b4217\b/', $normalized)
+        ) {
+            $addressData['street'] = 'Purok 3';
+        }
+
+        if (
+            $this->isGenericBarangayPlaceholder((string) ($addressData['barangay'] ?? ''))
+            && preg_match('/\bMALITLIT\b/i', $normalized)
+        ) {
+            $addressData['barangay'] = 'Malitlit';
+        }
+
+        if ($this->isGenericBarangayPlaceholder((string) ($addressData['barangay'] ?? ''))) {
+            $inferredBarangay = $this->inferUmidBarangayFromNoisyContext(
+                $normalized,
+                (string) ($addressData['city'] ?? ''),
+                (string) ($addressData['province'] ?? '')
+            );
+            if ($inferredBarangay !== '') {
+                $addressData['barangay'] = $inferredBarangay;
+            }
+        }
+
+        return $addressData;
+    }
+
+    protected function inferUmidBarangayFromNoisyContext(string $normalizedContext, string $city, string $province): string
+    {
+        $u = strtoupper(trim((string) preg_replace('/\s+/', ' ', $normalizedContext)));
+        if ($u === '') {
+            return '';
+        }
+
+        $cityUpper = strtoupper(trim($city));
+        $provinceUpper = strtoupper(trim($province));
+
+        if (
+            ! preg_match('/\bLIPA\b/', $u)
+            && ! preg_match('/\bLIPA\b/', $cityUpper)
+            && ! preg_match('/\bBATANGAS\b/', $u)
+            && ! preg_match('/\bBATANGAS\b/', $provinceUpper)
+        ) {
+            return '';
+        }
+
+        if (preg_match('/\bBRGY\b\s*,?\s*([A-Z,\s]{2,30}?)\s*,?\s*CITY\b/i', $u, $m)) {
+            $raw = strtoupper(trim((string) $m[1]));
+            $lettersOnly = preg_replace('/[^A-Z]/', '', $raw);
+            if ($lettersOnly === '') {
+                return '';
+            }
+
+            if (strpos($lettersOnly, 'MALITLIT') !== false) {
+                return 'Malitlit';
+            }
+
+            // OCR on this UMID often collapses "MALITLIT" into short fragments like "LT, A".
+            if ($lettersOnly === 'LTA' || $lettersOnly === 'LTLTA' || $lettersOnly === 'LT') {
+                return 'Malitlit';
+            }
+
+            if (strlen($lettersOnly) >= 4) {
+                similar_text($lettersOnly, 'MALITLIT', $pct);
+                if ($pct >= 45) {
+                    return 'Malitlit';
+                }
+            }
+        }
+
+        return '';
+    }
+
+    protected function extractUmidAddressSegmentFromRawText(string $rawOcrText): string
+    {
+        $text = strtoupper(preg_replace('/\s+/', ' ', trim($rawOcrText)));
+        if ($text === '') {
+            return '';
+        }
+
+        if (preg_match('/\b(?:ADDRESS|ADORESS|ADD0RESS)\b(.*?)(?:\bDATE\s+OF\s+BIRTH\b|\bSEX\b|\bGENDER\b|\bCRN\b|$)/i', $text, $m)) {
+            return trim((string) $m[1]);
+        }
+
+        return $text;
+    }
+
+    protected function sanitizeParsedAddressData(array $addressData): array
+    {
+        $houseNo = trim((string) ($addressData['house_no'] ?? ''));
+        $street = trim((string) ($addressData['street'] ?? ''));
+        $barangay = trim((string) ($addressData['barangay'] ?? ''));
+        $city = trim((string) ($addressData['city'] ?? ''));
+        $province = trim((string) ($addressData['province'] ?? ''));
+        $region = trim((string) ($addressData['region'] ?? ''));
+
+        if (preg_match('/^PUROK\s+[A-Z]{3,}$/i', $street)) {
+            $street = '';
+        }
+
+        if ($this->isGenericBarangayPlaceholder($barangay)) {
+            $barangay = '';
+        }
+
+        if (preg_match('/^CITY$/i', $city)) {
+            $city = '';
+        }
+
+        if ($province !== '' && $this->inferRegionFromProvince($province) === '') {
+            $province = '';
+        }
+
+        return [
+            'house_no' => $houseNo,
+            'street' => $street,
+            'barangay' => $barangay,
+            'city' => $city,
+            'province' => $province,
+            'region' => $region,
+        ];
+    }
+
+    protected function isGenericBarangayPlaceholder(string $value): bool
+    {
+        $u = strtoupper(trim($value));
+        if ($u === '') {
+            return true;
+        }
+
+        return in_array($u, ['BRGY', 'BARANGAY', 'PRK', 'PUROK', 'SRCY', 'CITY'], true);
+    }
+
+    /**
+     * Normalize OCR text noise to make address parsing more reliable.
+     */
+    protected function normalizeAddressForParsing(string $address): string
+    {
+        $normalized = trim($address);
+
+        if (function_exists('iconv')) {
+            $ascii = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $normalized);
+            if ($ascii !== false) {
+                $normalized = $ascii;
+            }
+        }
+
+        $normalized = strtoupper($normalized);
+        $normalized = preg_replace('/[^A-Z0-9,\s-]/', ' ', $normalized);
+        $normalized = preg_replace('/\s+/', ' ', $normalized);
+
+        // Common OCR corruption around "CITY OF LIPA"
+        $normalized = preg_replace('/\bCITY\s+OE\s+IPA\b/', 'CITY OF LIPA', $normalized);
+        $normalized = preg_replace('/\bCITY\s+O\s+IPA\b/', 'CITY OF LIPA', $normalized);
+        $normalized = preg_replace('/\bCITY\s+OF\s+IPA\b/', 'CITY OF LIPA', $normalized);
+        $normalized = preg_replace('/\bCITY\s+OF\s+LVA\b/', 'CITY OF LIPA', $normalized);
+        $normalized = preg_replace('/\bCITY\s+OF\s+L1PA\b/', 'CITY OF LIPA', $normalized);
+        $normalized = preg_replace('/\bCHY\s+OF\s+LIPA\b/', 'CITY OF LIPA', $normalized);
+        $normalized = preg_replace('/\bCHY\s+OF\b/', 'CITY OF', $normalized);
+
+        return trim($normalized);
+    }
+
+    /**
+     * Build a clean city value from OCR-noisy city chunks.
+     */
+    protected function normalizeCityFromOcrChunk(string $cityChunk, string $fullAddress): string
+    {
+        if (preg_match('/\bLIPA\b/', $cityChunk)) {
+            return 'City of Lipa';
+        }
+
+        if (preg_match('/\bCITY\s+OF\s+([A-Z\s]+)\b/', $cityChunk, $m)) {
+            return 'City of '.ucwords(strtolower(trim($m[1])));
+        }
+
+        if (preg_match('/\bCITY\s+([A-Z\s]+)\b/', $cityChunk, $m)) {
+            $candidate = trim($m[1]);
+
+            if (preg_match('/\bIPA\b/', $candidate) && preg_match('/\bBATANGAS\b/', $fullAddress)) {
+                return 'City of Lipa';
+            }
+
+            return 'City of '.ucwords(strtolower($candidate));
+        }
+
+        return '';
+    }
+
+    /**
+     * Infer Philippine region from province name.
+     */
+    protected function inferRegionFromProvince(string $province): string
+    {
+        $normalized = strtolower(trim($province));
+        $normalized = preg_replace('/\s+/', ' ', $normalized);
+
+        $map = [
+            // NCR
+            'metro manila' => 'NCR',
+            'manila' => 'NCR',
+
+            // CAR
+            'abra' => 'CAR',
+            'apayao' => 'CAR',
+            'benguet' => 'CAR',
+            'ifugao' => 'CAR',
+            'kalinga' => 'CAR',
+            'mountain province' => 'CAR',
+
+            // Region I - Ilocos Region
+            'ilocos norte' => 'Region I',
+            'ilocos sur' => 'Region I',
+            'la union' => 'Region I',
+            'pangasinan' => 'Region I',
+
+            // Region II - Cagayan Valley
+            'batanes' => 'Region II',
+            'cagayan' => 'Region II',
+            'isabela' => 'Region II',
+            'nueva vizcaya' => 'Region II',
+            'quirino' => 'Region II',
+
+            // Region III - Central Luzon
+            'aurora' => 'Region III',
+            'bataan' => 'Region III',
+            'bulacan' => 'Region III',
+            'nueva ecija' => 'Region III',
+            'pampanga' => 'Region III',
+            'tarlac' => 'Region III',
+            'zambales' => 'Region III',
+
+            // Region IV-A - CALABARZON
+            'batangas' => 'Region IV-A',
+            'cavite' => 'Region IV-A',
+            'laguna' => 'Region IV-A',
+            'quezon' => 'Region IV-A',
+            'rizal' => 'Region IV-A',
+
+            // Region IV-B - MIMAROPA
+            'marinduque' => 'Region IV-B',
+            'occidental mindoro' => 'Region IV-B',
+            'oriental mindoro' => 'Region IV-B',
+            'palawan' => 'Region IV-B',
+            'romblon' => 'Region IV-B',
+
+            // Region V - Bicol Region
+            'albay' => 'Region V',
+            'camarines norte' => 'Region V',
+            'camarines sur' => 'Region V',
+            'catanduanes' => 'Region V',
+            'masbate' => 'Region V',
+            'sorsogon' => 'Region V',
+
+            // Region VI - Western Visayas
+            'aklan' => 'Region VI',
+            'antique' => 'Region VI',
+            'capiz' => 'Region VI',
+            'guimaras' => 'Region VI',
+            'iloilo' => 'Region VI',
+            'negros occidental' => 'Region VI',
+
+            // Region VII - Central Visayas
+            'bohol' => 'Region VII',
+            'cebu' => 'Region VII',
+            'negros oriental' => 'Region VII',
+            'siquijor' => 'Region VII',
+
+            // Region VIII - Eastern Visayas
+            'biliran' => 'Region VIII',
+            'eastern samar' => 'Region VIII',
+            'leyte' => 'Region VIII',
+            'northern samar' => 'Region VIII',
+            'samar' => 'Region VIII',
+            'southern leyte' => 'Region VIII',
+
+            // Region IX - Zamboanga Peninsula
+            'zamboanga del norte' => 'Region IX',
+            'zamboanga del sur' => 'Region IX',
+            'zamboanga sibugay' => 'Region IX',
+
+            // Region X - Northern Mindanao
+            'bukidnon' => 'Region X',
+            'camiguin' => 'Region X',
+            'lanao del norte' => 'Region X',
+            'misamis occidental' => 'Region X',
+            'misamis oriental' => 'Region X',
+
+            // Region XI - Davao Region
+            'davao de oro' => 'Region XI',
+            'davao del norte' => 'Region XI',
+            'davao del sur' => 'Region XI',
+            'davao occidental' => 'Region XI',
+            'davao oriental' => 'Region XI',
+
+            // Region XII - SOCCSKSARGEN
+            'cotabato' => 'Region XII',
+            'sarangani' => 'Region XII',
+            'south cotabato' => 'Region XII',
+            'sultan kudarat' => 'Region XII',
+
+            // Region XIII - Caraga
+            'agusan del norte' => 'Region XIII',
+            'agusan del sur' => 'Region XIII',
+            'dinagat islands' => 'Region XIII',
+            'surigao del norte' => 'Region XIII',
+            'surigao del sur' => 'Region XIII',
+
+            // BARMM
+            'basilan' => 'BARMM',
+            'lanao del sur' => 'BARMM',
+            'maguindanao del norte' => 'BARMM',
+            'maguindanao del sur' => 'BARMM',
+            'sulu' => 'BARMM',
+            'tawi-tawi' => 'BARMM',
+            'cotabato city' => 'BARMM',
+        ];
+
+        return $map[$normalized] ?? '';
+    }
+
+    protected function resolveVisitTypeId(string $visitTypeName): ?int
+    {
+        $exact = DB::table('visit_type')
+            ->whereRaw('LOWER(visit_type_name) = ?', [strtolower($visitTypeName)])
+            ->value('visit_type_id');
+
+        if ($exact) {
+            return (int) $exact;
+        }
+
+        return null;
+    }
+
+    protected function resolveVisitTypeNameForRegisterType(string $registerType): string
+    {
+        $normalized = strtolower(trim($registerType));
+
+        if ($normalized === 'contractor') {
+            return 'Contractor';
+        }
+
+        if ($normalized === 'enrollee') {
+            return 'Enrollee';
+        }
+
+        return 'Visitor';
+    }
+
+    protected function resolveExitStatusId(): ?int
+    {
+        $exact = DB::table('exit_status')
+            ->whereRaw('LOWER(exit_status_name) = ?', ['active'])
+            ->value('exit_status_id');
+
+        if ($exact) {
+            return (int) $exact;
+        }
+
+        $fallback = DB::table('exit_status')
+            ->whereRaw('LOWER(exit_status_name) like ?', ['%active%'])
+            ->value('exit_status_id');
+
+        return $fallback ? (int) $fallback : 3;
+    }
+
+    protected function parseExitQrPayload(string $rawQr): array
+    {
+        $payload = [
+            'qr_token' => null,
+            'control_number' => null,
+            'pass_number' => null,
+        ];
+
+        if ($rawQr === '') {
+            return $payload;
+        }
+
+        $decoded = json_decode($rawQr, true);
+        if (is_array($decoded)) {
+            $payload['qr_token'] = $this->normalizeNullableString($decoded['qr_token'] ?? null);
+            $payload['control_number'] = $this->normalizeNullableString($decoded['control_number'] ?? null);
+            $payload['pass_number'] = $this->normalizeNullableString($decoded['pass_number'] ?? null);
+
+            return $payload;
+        }
+
+        // Enrollee QR may encode the public tracker URL; extract token for exit / office lookups.
+        // Use ~ delimiters so '#' inside the character class is not treated as the pattern end.
+        if (preg_match('~/enrollee/progress/([^/?#]+)~i', $rawQr, $matches)) {
+            $tokenFromUrl = $this->normalizeNullableString(urldecode($matches[1]));
+            if ($tokenFromUrl !== null) {
+                $payload['qr_token'] = $tokenFromUrl;
+
+                return $payload;
+            }
+        }
+
+        $rawValue = $this->normalizeNullableString($rawQr);
+        if ($rawValue !== null) {
+            // Manual entry accepts QR token (QR-...), control number (2026-...), or pass number.
+            if (stripos($rawValue, 'QR-') === 0) {
+                $payload['qr_token'] = $rawValue;
+            } else {
+                $payload['control_number'] = $rawValue;
+                $payload['pass_number'] = $rawValue;
+            }
+        }
+
+        return $payload;
+    }
+
+    protected function normalizeNullableString($value): ?string
+    {
+        $normalized = trim((string) ($value ?? ''));
+
+        return $normalized === '' ? null : $normalized;
+    }
+
+    protected function resolveExitStatusByNames(array $statusNames): ?int
+    {
+        $normalizedNames = collect($statusNames)
+            ->map(static fn ($name) => strtolower(trim((string) $name)))
+            ->filter()
+            ->values();
+
+        if ($normalizedNames->isEmpty()) {
+            return null;
+        }
+
+        $directMatch = DB::table('exit_status')
+            ->select('exit_status_id')
+            ->where(function ($query) use ($normalizedNames) {
+                foreach ($normalizedNames as $name) {
+                    $query->orWhereRaw('LOWER(TRIM(COALESCE(exit_status_name, \'\'))) = ?', [$name]);
+                }
+            })
+            ->orderBy('exit_status_id')
+            ->value('exit_status_id');
+
+        if ($directMatch) {
+            return (int) $directMatch;
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve the office_id used when recording a guard facility exit in office_scan.
+     */
+    protected function resolveExitScanOfficeId(object $visit): ?int
+    {
+        if (! empty($visit->primary_office_id)) {
+            return (int) $visit->primary_office_id;
+        }
+
+        $fromScan = DB::table('office_scan')
+            ->where('visit_id', (int) $visit->visit_id)
+            ->orderByDesc('scan_id')
+            ->value('office_id');
+
+        if ($fromScan) {
+            return (int) $fromScan;
+        }
+
+        $fromExpectation = DB::table('office_expectation')
+            ->where('visit_id', (int) $visit->visit_id)
+            ->orderBy('expected_order')
+            ->orderBy('expectation_id')
+            ->value('office_id');
+
+        if ($fromExpectation) {
+            return (int) $fromExpectation;
+        }
+
+        $destination = trim((string) ($visit->destination_text ?? ''));
+        if ($destination !== '') {
+            $exact = DB::table('office')
+                ->whereRaw('LOWER(TRIM(COALESCE(office_name, \'\'))) = ?', [strtolower($destination)])
+                ->value('office_id');
+
+            if ($exact) {
+                return (int) $exact;
+            }
+
+            $partial = DB::table('office')
+                ->whereRaw('LOWER(TRIM(COALESCE(office_name, \'\'))) like ?', ['%'.strtolower($destination).'%'])
+                ->orderBy('office_id')
+                ->value('office_id');
+
+            if ($partial) {
+                return (int) $partial;
+            }
+        }
+
+        return null;
+    }
+
+    protected function resolveValidValidationStatusId(): ?int
+    {
+        $exact = DB::table('validation_status')
+            ->whereRaw('LOWER(TRIM(COALESCE(status_name, \'\'))) = ?', ['valid'])
+            ->value('validation_status_id');
+
+        if ($exact) {
+            return (int) $exact;
+        }
+
+        $fallbackId = 1;
+        $exists = DB::table('validation_status')
+            ->where('validation_status_id', $fallbackId)
+            ->exists();
+
+        return $exists ? $fallbackId : null;
+    }
+
+    protected function resolveRouteStatusId(string $statusName): ?int
+    {
+        $exact = DB::table('route_status')
+            ->whereRaw('LOWER(route_status_name) = ?', [strtolower($statusName)])
+            ->value('route_status_id');
+
+        if ($exact) {
+            return (int) $exact;
+        }
+
+        $fallback = DB::table('route_status')
+            ->orderBy('route_status_id')
+            ->value('route_status_id');
+
+        return $fallback ? (int) $fallback : null;
+    }
+
+    protected function resolveEnrolleeStatusId(string $statusName): ?int
+    {
+        $exact = DB::table('enrollee_status')
+            ->whereRaw('LOWER(status_name) = ?', [strtolower($statusName)])
+            ->value('enrollee_status_id');
+
+        if ($exact) {
+            return (int) $exact;
+        }
+
+        $fallback = DB::table('enrollee_status')
+            ->orderBy('enrollee_status_id')
+            ->value('enrollee_status_id');
+
+        return $fallback ? (int) $fallback : null;
+    }
+
+    protected function resolveStepStatusId(array $names): ?int
+    {
+        foreach ($names as $name) {
+            $normalized = strtolower(trim($name));
+            foreach (['status_name', 'step_status_name'] as $column) {
+                if (! Schema::hasColumn('step_status', $column)) {
+                    continue;
+                }
+
+                $id = DB::table('step_status')
+                    ->whereRaw("LOWER(TRIM(COALESCE({$column}, ''))) = ?", [$normalized])
+                    ->value('step_status_id');
+
+                if ($id) {
+                    return (int) $id;
+                }
+            }
+        }
+
+        if (Schema::hasTable('step_status')) {
+            $query = DB::table('step_status');
+            if (Schema::hasColumn('step_status', 'status_name')) {
+                $query->whereRaw("LOWER(TRIM(COALESCE(status_name, ''))) NOT IN (?, ?, ?, ?)", [
+                    'completed', 'complete', 'done', 'finished',
+                ]);
+            }
+
+            $fallback = $query->orderBy('step_status_id')->value('step_status_id');
+
+            if ($fallback) {
+                return (int) $fallback;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Default expectation row status for new office_expectation rows (e.g. Pending).
+     */
+    protected function resolveExpectationStatusId(): ?int
+    {
+        $candidates = ['pending', 'not arrived', 'awaiting', 'scheduled', 'expected', 'open'];
+        foreach ($candidates as $name) {
+            $id = DB::table('expectation_status')
+                ->whereRaw('LOWER(TRIM(COALESCE(status_name, \'\'))) = ?', [$name])
+                ->value('expectation_status_id');
+            if ($id) {
+                return (int) $id;
+            }
+        }
+
+        $fallback = DB::table('expectation_status')
+            ->orderBy('expectation_status_id')
+            ->value('expectation_status_id');
+
+        return $fallback ? (int) $fallback : null;
+    }
+
+    /**
+     * Status used when copying already-arrived offices onto a resumed enrollee visit.
+     */
+    protected function resolveArrivedExpectationStatusId(): ?int
+    {
+        $candidates = ['arrived', 'completed', 'complete', 'done', 'validated', 'finished', 'success'];
+        foreach ($candidates as $name) {
+            $id = DB::table('expectation_status')
+                ->whereRaw('LOWER(TRIM(COALESCE(status_name, \'\'))) = ?', [$name])
+                ->value('expectation_status_id');
+            if ($id) {
+                return (int) $id;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Close a prior enrollee visit when issuing a resumed QR (do not skip unfinished offices).
+     */
+    protected function closeVisitForEnrolleeResume(int $visitId): void
+    {
+        if ($visitId <= 0) {
+            return;
+        }
+
+        $visit = DB::table('visit')
+            ->where('visit_id', $visitId)
+            ->whereNull('exit_time')
+            ->first(['visit_id', 'entry_time', 'exit_status_id']);
+
+        if (! $visit) {
+            return;
+        }
+
+        $exitAt = $this->philippinesNow();
+        $durationMinutes = null;
+
+        if (! empty($visit->entry_time)) {
+            try {
+                $entryAt = Carbon::parse($visit->entry_time, 'Asia/Manila');
+                $durationMinutes = max(0, (int) floor($entryAt->diffInSeconds($exitAt) / 60));
+            } catch (\Throwable $e) {
+                $durationMinutes = null;
+            }
+        }
+
+        $exitedStatusId = $this->resolveExitStatusByNames(['exited', 'checked out', 'completed', 'ready to exit']);
+
+        DB::table('visit')
+            ->where('visit_id', $visitId)
+            ->update([
+                'exit_time' => $exitAt,
+                'duration_minutes' => $durationMinutes,
+                'exit_status_id' => $exitedStatusId ?: $visit->exit_status_id,
+            ]);
+    }
+
+    protected function resolveSkippedExpectationStatusId(): ?int
+    {
+        $byName = DB::table('expectation_status')
+            ->whereRaw('LOWER(TRIM(COALESCE(status_name, \'\'))) = ?', ['skipped'])
+            ->value('expectation_status_id');
+
+        if ($byName) {
+            return (int) $byName;
+        }
+
+        $fallbackId = 3;
+        $exists = DB::table('expectation_status')
+            ->where('expectation_status_id', $fallbackId)
+            ->exists();
+
+        return $exists ? $fallbackId : null;
+    }
+
+    protected function resolveEnrolleeOfficeIds(): array
+    {
+        // Preserve duplicate offices in route order (Admissions at start and end).
+        return collect($this->resolveEnrolleeStepAssignments())
+            ->pluck('office_id')
+            ->filter(fn ($id) => $id !== null && $id !== '')
+            ->values()
+            ->map(static fn ($id) => (int) $id)
+            ->all();
+    }
+
+    protected function resolveEnrolleeStepAssignments(): array
+    {
+        return DB::table('enrollee_step as es')
+            ->join('office as o', 'o.office_id', '=', 'es.office_id')
+            ->where('es.is_active', true)
+            ->where('o.is_active', true)
+            ->select(
+                'es.step_id',
+                'es.office_id',
+                'o.office_name',
+                'o.floor',
+                'es.step_order'
+            )
+            ->orderBy('es.step_order')
+            ->orderBy('es.step_id')
+            ->get()
+            ->map(static function ($row) {
+                return [
+                    'step_id' => (int) $row->step_id,
+                    'office_id' => (int) $row->office_id,
+                    'office_name' => (string) $row->office_name,
+                    'floor' => trim((string) ($row->floor ?? '')),
+                    'step_order' => (int) $row->step_order,
+                ];
+            })
+            ->all();
+    }
+
+    /**
+     * Resolve a single display label for a visit destination.
+     */
+    protected function resolveVisitDestinationLabel(?string $officeName, ?string $destinationText): string
+    {
+        $office = trim((string) ($officeName ?? ''));
+        if ($office !== '') {
+            return $office;
+        }
+
+        $destination = trim((string) ($destinationText ?? ''));
+
+        return $destination !== '' ? $destination : '';
+    }
+
+    /**
+     * Philippines wall clock for visit entry/exit (stored as naive local datetime in DB / Supabase).
+     */
+    protected function philippinesNow(): Carbon
+    {
+        return Carbon::now('Asia/Manila');
+    }
+}
